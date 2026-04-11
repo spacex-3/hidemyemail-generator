@@ -46,6 +46,21 @@ class Progress:
         self.success_in_cycle = 0
         self.cycle_size = CYCLE_SIZE
         self.started_at = 0
+        self.interval = 45
+
+    def load_historical_emails(self):
+        file_path = f"emails-{self.account}.txt"
+        self.emails = []
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    parts = line.split(",", 1)
+                    if len(parts) == 2:
+                        self.emails.append({"email": parts[0], "time": parts[1]})
+                    else:
+                        self.emails.append({"email": parts[0], "time": ""})
 
     def to_dict(self):
         return {
@@ -61,13 +76,13 @@ class Progress:
             "success_in_cycle": self.success_in_cycle,
             "cycle_size": self.cycle_size,
             "started_at": self.started_at,
+            "interval": self.interval,
         }
 
     def reset(self, target: int):
         """Reset for a fresh generation run."""
         self.target = target
         self.completed = 0
-        self.emails = []
         self.errors = 0
         self.success_in_cycle = 0
         self.started_at = 0
@@ -169,18 +184,30 @@ class RichHideMyEmail(HideMyEmail):
     async def _generate_batch(self, count: int):
         tasks = [asyncio.ensure_future(self._generate_one()) for _ in range(count)]
         results = await asyncio.gather(*tasks)
-        return [e for e in results if e is not None]
+        
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        batch = []
+        for e in results:
+            if e:
+                batch.append({"email": e, "time": now})
+        return batch
 
-    def _save_emails(self, emails: List[str]):
+    def _save_emails(self, emails: List[dict]):
         if emails:
-            with open(self._email_file, "a+") as f:
-                f.write(os.linesep.join(emails) + os.linesep)
+            with open(self._email_file, "a+", encoding="utf-8") as f:
+                lines = [f"{e['email']},{e['time']}" for e in emails]
+                f.write(os.linesep.join(lines) + os.linesep)
 
     # ── cooldown ─────────────────────────────────────────────
 
-    async def _long_cooldown(self, reason: str, stop_event: asyncio.Event = None):
+    async def _long_cooldown(self, reason: str, stop_event: asyncio.Event = None, override_minutes: int = 0):
         """Returns True if stopped during cooldown."""
-        cooldown_minutes = random.randint(LONG_COOLDOWN_MIN, LONG_COOLDOWN_MAX)
+        if override_minutes > 0:
+            cooldown_minutes = override_minutes
+        else:
+            base_interval = getattr(self.progress, "interval", 45)
+            base_interval = max(30, base_interval)  # minimum 30 min limit
+            cooldown_minutes = base_interval + random.randint(1, 3)
         total_seconds = cooldown_minutes * 60
 
         self.progress.status = "long_cooldown"
@@ -240,6 +267,9 @@ class RichHideMyEmail(HideMyEmail):
             remaining = count
             success_in_cycle = self.progress.success_in_cycle
             batch_num = 0
+            
+            recovering_from_cooldown = False
+            cycle_rate_limit_retries = 3
 
             while remaining > 0:
                 # ── stop check ──
@@ -289,6 +319,9 @@ class RichHideMyEmail(HideMyEmail):
                     remaining -= len(batch)
                     success_in_cycle += len(batch)
                     self.progress.success_in_cycle = success_in_cycle
+                    
+                    recovering_from_cooldown = False
+                    cycle_rate_limit_retries = 3
 
                     console.log(
                         f"{self._tag} [dim]💾 Saved {len(batch)}. "
@@ -299,18 +332,39 @@ class RichHideMyEmail(HideMyEmail):
                 # ── rate limited ──
                 if self._rate_limited:
                     if remaining > 0:
-                        console.log(
-                            f"{self._tag} [bold yellow]⚠ Rate limited. "
-                            f"{remaining} remaining[/]"
-                        )
-                        was_stopped = await self._long_cooldown(
-                            "Rate limited by Apple", stop_event
-                        )
-                        if was_stopped:
-                            return
-                        success_in_cycle = 0
-                        self.progress.success_in_cycle = 0
-                        batch_num = 0
+                        if recovering_from_cooldown:
+                            # Hit limit immediately after a cooldown -- retry in 5 mins
+                            was_stopped = await self._long_cooldown(
+                                "Recovery check failed", stop_event, override_minutes=5
+                            )
+                            if was_stopped:
+                                return
+                        elif cycle_rate_limit_retries > 0:
+                            # Hit limit during active cycle, do a short retry first
+                            cycle_rate_limit_retries -= 1
+                            console.log(
+                                f"{self._tag} [bold yellow]⚠ Rate limited. "
+                                f"Retrying ({3 - cycle_rate_limit_retries}/3) in 5s...[/]"
+                            )
+                            await asyncio.sleep(5)
+                            if stop_event and stop_event.is_set():
+                                return
+                        else:
+                            # Max retries exhausted, perform normal long cooldown
+                            console.log(
+                                f"{self._tag} [bold yellow]⚠ Rate limited max retries. "
+                                f"{remaining} remaining[/]"
+                            )
+                            was_stopped = await self._long_cooldown(
+                                "Rate limited exhausted", stop_event
+                            )
+                            if was_stopped:
+                                return
+                            recovering_from_cooldown = True
+                            cycle_rate_limit_retries = 3
+                            success_in_cycle = 0
+                            self.progress.success_in_cycle = 0
+                            batch_num = 0
 
                 # ── proactive cycle cooldown ──
                 elif success_in_cycle >= CYCLE_SIZE and remaining > 0:
@@ -323,6 +377,8 @@ class RichHideMyEmail(HideMyEmail):
                     )
                     if was_stopped:
                         return
+                    recovering_from_cooldown = True
+                    cycle_rate_limit_retries = 3
                     success_in_cycle = 0
                     self.progress.success_in_cycle = 0
                     batch_num = 0
@@ -401,6 +457,7 @@ class GenerationManager:
             if aid not in self.accounts:
                 progress = Progress()
                 progress.account = aid
+                progress.load_historical_emails()
                 self.accounts[aid] = (session, progress)
                 console.log(f"  • {aid} [dim]({session.status})[/]")
 
@@ -422,6 +479,7 @@ class GenerationManager:
         session = ICloudSession(apple_id, domain=domain)
         progress = Progress()
         progress.account = apple_id
+        progress.load_historical_emails()
         self.accounts[apple_id] = (session, progress)
 
         loop = asyncio.get_event_loop()
@@ -457,7 +515,7 @@ class GenerationManager:
 
     # ── generation control ───────────────────────────────────
 
-    async def start_account(self, apple_id: str, count: int):
+    async def start_account(self, apple_id: str, count: int, interval: int = 45):
         """Start fresh generation (resets progress)."""
         if apple_id not in self.accounts:
             return "Account not found"
@@ -465,9 +523,16 @@ class GenerationManager:
         # Ensure authentication is valid first
         session, progress = self.accounts[apple_id]
         loop = asyncio.get_event_loop()
-        auth_result = await loop.run_in_executor(
-            None, session.ensure_authenticated
-        )
+        try:
+            auth_result = await asyncio.wait_for(
+                loop.run_in_executor(None, session.ensure_authenticated),
+                timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            auth_result = "Exception: Apple authentication server timed out."
+        except Exception as e:
+            auth_result = f"Exception: {e}"
+
         if auth_result != "ok":
             progress.status = "error"
             progress.message = f"Auth: {auth_result}"
@@ -476,6 +541,7 @@ class GenerationManager:
         await self._cancel_task(apple_id)
 
         progress.reset(count)
+        progress.interval = interval
 
         stop_event = asyncio.Event()
         self._stop_events[apple_id] = stop_event
@@ -504,13 +570,22 @@ class GenerationManager:
 
         # Re-check auth
         loop = asyncio.get_event_loop()
-        auth_result = await loop.run_in_executor(
-            None, session.ensure_authenticated
-        )
+        try:
+            auth_result = await asyncio.wait_for(
+                loop.run_in_executor(None, session.ensure_authenticated),
+                timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            auth_result = "Exception: Apple authentication server timed out."
+        except Exception as e:
+            auth_result = f"Exception: {e}"
+
         if auth_result != "ok":
             progress.status = "error"
             progress.message = f"Auth: {auth_result}"
             return auth_result
+
+        await self._cancel_task(apple_id)
 
         stop_event = asyncio.Event()
         self._stop_events[apple_id] = stop_event

@@ -283,11 +283,14 @@ function mk(a,i){
         <div class="acct-r1">
             <span class="acct-name" style="color:${c}">📧 ${a.account}</span>
             <div class="acct-ctrl" id="ctrl${i}">
-                <input type="number" class="cnt-input" id="ci${i}" value="5" min="1" max="9999" placeholder="#">
+                <label style="font-size:0.65rem;color:var(--t2)">目标</label>
+                <input type="number" class="cnt-input" id="ci${i}" value="5" min="1" max="9999" style="width:48px;" title="生成数量">
+                <label style="font-size:0.65rem;color:var(--t2);margin-left:3px">间隔(min)</label>
+                <input type="number" class="cnt-input" id="itv${i}" value="45" min="1" max="999" style="width:42px;" title="轮次间隔">
                 <button class="cb start" id="go${i}" onclick="goA(${i})">▶ Start</button>
                 <button class="cb stop" id="sp${i}" onclick="spA(${i})" style="display:none">⏹ Stop</button>
-                <button class="cb resume" id="rs${i}" onclick="rsA(${i})" style="display:none">▶ Resume</button>
-                <button class="cb start mini" id="rt${i}" onclick="goA(${i})" style="display:none" title="Restart">↺</button>
+                <button class="cb resume" id="rs${i}" onclick="rsA(${i})" style="display:none" title="Resume: 继续由于 Stop 暂停的进度">▶ Resume</button>
+                <button class="cb start mini" id="rt${i}" onclick="goA(${i})" style="display:none" title="Restart: 进度清零，并按照输入框新值重新开始此账号任务">↺ Restart</button>
             </div>
             <span class="badge"><span class="dot" id="d${i}"></span> <span id="s${i}">Idle</span></span>
             <span class="acct-fp" id="f${i}">—</span>
@@ -300,8 +303,12 @@ function mk(a,i){
             <span class="auth-del" onclick="removeA(${i})">✕ Remove</span>
         </div>
         <div class="acct-bars" id="bars${i}" style="display:none">
-            <div class="bg">
+            <div class="bg" style="min-width:60px;flex:none">
                 <span class="bl">Total</span>
+                <span class="bn" id="nTot${i}" style="text-align:left;color:var(--t1)">0</span>
+            </div>
+            <div class="bg">
+                <span class="bl">Target</span>
                 <div class="bt"><div class="bf" id="b${i}" style="width:0%"></div></div>
                 <span class="bn" id="n${i}">0/0</span>
             </div>
@@ -353,14 +360,21 @@ function up(a,i){
     // Buttons
     sh('go'+i, idle); sh('sp'+i, run); sh('rs'+i, canResume); sh('rt'+i, stopped);
     const ci=gid('ci'+i); if(ci){ci.disabled=run||needsAuth; if(needsAuth)ci.style.display='none'; else ci.style.display='';}
+    const itv=gid('itv'+i); if(itv){itv.disabled=run||needsAuth; if(needsAuth)itv.style.display='none'; else itv.style.display='';}
     if(run && a.target>0 && ci) ci.value=a.target;
+    if(run && a.interval && itv) itv.value=a.interval;
 
     // Disable start if not authenticated
     const goBtn=gid('go'+i); if(goBtn) goBtn.disabled=needsAuth;
+    const l1=ci?.previousElementSibling; if(l1) l1.style.display=needsAuth?'none':'';
+    const l2=itv?.previousElementSibling; if(l2) l2.style.display=needsAuth?'none':'';
 
     // Show bars/footer only after started
     const started=a.target>0 && isAuth;
-    sh('bars'+i, started); sh('ft'+i, started);
+    sh('bars'+i, isAuth); sh('ft'+i, isAuth);
+
+    // Totals
+    st('nTot'+i, a.emails?a.emails.length:0);
 
     // Fingerprint
     st('f'+i, isAuth?(a.fingerprint||'—'):'—');
@@ -401,7 +415,7 @@ function up(a,i){
             el._c=a.emails.length;
             el.innerHTML=a.emails.slice().reverse().map((e,j)=>{
                 const n=a.emails.length-j;
-                return `<div class="ei"><span class="eix">${n}.</span>${e}</div>`;
+                return `<div class="ei" style="display:flex;justify-content:space-between"><span><span class="eix">${n}.</span>${e.email}</span><span style="font-size:0.65rem;color:var(--tm)">${e.time||''}</span></div>`;
             }).join('');
         }
     }
@@ -510,30 +524,42 @@ async function removeA(i){
 
 // ── Generation API ──
 async function goA(i){
-    const a=S.accounts[i], c=parseInt(gid('ci'+i).value);
-    if(!c||c<1){gid('ci'+i).focus();return;}
-    const r=await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/start',
-        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:c})});
-    const d=await r.json();
-    if(d.result && d.result!=='ok') alert(d.result);
-    poll();
+    try {
+        const a=S.accounts[i], c=parseInt(gid('ci'+i).value), itv=parseInt(gid('itv'+i).value)||45;
+        if(!c||c<1){gid('ci'+i).focus();return;}
+        const r=await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/start',
+            {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:c,interval:itv})});
+        const d=await r.json();
+        if(d.result && d.result!=='ok') alert(d.result);
+        poll();
+    } catch(e) {
+        alert('Error: ' + e.message);
+    }
 }
 async function spA(i){
-    const a=S.accounts[i];
-    await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/stop',{method:'POST'});
-    poll();
+    try {
+        const a=S.accounts[i];
+        await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/stop',{method:'POST'});
+        poll();
+    } catch(e) {
+        alert('Error: ' + e.message);
+    }
 }
 async function rsA(i){
-    const a=S.accounts[i];
-    const r=await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/resume',{method:'POST'});
-    const d=await r.json();
-    if(d.result && d.result!=='ok') alert(d.result);
-    poll();
+    try {
+        const a=S.accounts[i];
+        const r=await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/resume',{method:'POST'});
+        const d=await r.json();
+        if(d.result && d.result!=='ok') alert(d.result);
+        poll();
+    } catch(e) {
+        alert('Error: ' + e.message);
+    }
 }
 function cpA(i){
     const a=S.accounts[i];
     if(!a||!a.emails||!a.emails.length)return;
-    navigator.clipboard.writeText(a.emails.join('\n')).then(()=>{
+    navigator.clipboard.writeText(a.emails.map(e=>e.email).join('\n')).then(()=>{
         const b=gid('cp'+i);b.textContent='✓';b.classList.add('ok');
         setTimeout(()=>{b.textContent='copy';b.classList.remove('ok')},1500);
     });
@@ -541,7 +567,7 @@ function cpA(i){
 function copyAll(){
     const all=S.accounts.flatMap(a=>a.emails||[]);
     if(!all.length)return;
-    navigator.clipboard.writeText(all.join('\n')).then(()=>{
+    navigator.clipboard.writeText(all.map(e=>e.email).join('\n')).then(()=>{
         const b=gid('cpa');b.textContent='Copied!';b.classList.add('ok');
         setTimeout(()=>{b.textContent='Copy All';b.classList.remove('ok')},2000);
     });
@@ -549,7 +575,7 @@ function copyAll(){
 async function startAll(){
     for(let i=0;i<S.accounts.length;i++){
         const a=S.accounts[i];
-        if(a.auth_status===AUTH_OK && ['idle','done','error'].includes(a.status)){
+        if(a.auth_status===AUTH_OK && ['idle','done','error','stopped'].includes(a.status)){
             const c=parseInt(gid('ci'+i).value);
             if(c&&c>0) await goA(i);
         }
@@ -644,8 +670,9 @@ async def handle_start(request):
     apple_id = request.match_info["account"]
     data = await request.json()
     count = int(data.get("count", 5))
+    interval = int(data.get("interval", 45))
     manager = request.app["manager"]
-    result = await manager.start_account(apple_id, count)
+    result = await manager.start_account(apple_id, count, interval)
     return web.json_response({"result": result})
 
 
