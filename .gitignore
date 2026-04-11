@@ -6,5 +6,6 @@ emails.txt
 emails-*.txt
 cookie.txt
 cookies-*.txt
+sessions/
 **/.DS_Store
 *.spec

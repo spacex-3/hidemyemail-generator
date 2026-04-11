@@ -10,8 +10,8 @@ import re
 from rich.console import Console
 from rich.table import Table
 
-from icloud import HideMyEmail
-from icloud.hidemyemail import is_rate_limited
+from icloud import HideMyEmail, is_rate_limited
+from icloud.auth import ICloudSession, load_saved_sessions
 
 
 BATCH_SIZE = 2
@@ -385,100 +385,173 @@ class RichHideMyEmail(HideMyEmail):
 # ══════════════════════════════════════════════════════════════
 
 class GenerationManager:
-    """Manages multi-account generation with start/stop/resume per account."""
+    """Manages multi-account generation with Apple ID auth + start/stop/resume."""
 
     def __init__(self):
-        self.accounts = {}       # account_name -> (cookie_str, Progress)
-        self._tasks = {}         # account_name -> asyncio.Task
-        self._stop_events = {}   # account_name -> asyncio.Event
+        self.accounts = {}       # apple_id -> (ICloudSession, Progress)
+        self._tasks = {}         # apple_id -> asyncio.Task
+        self._stop_events = {}   # apple_id -> asyncio.Event
 
-    # ── discovery ────────────────────────────────────────────
+    # ── session management ───────────────────────────────────
 
-    def discover(self):
-        """Scan for cookies-*.txt files and populate accounts."""
-        cookie_files = sorted(glob.glob("cookies-*.txt"))
-        for cf in cookie_files:
-            account = cf[len("cookies-"):-len(".txt")]
-            with open(cf) as f:
-                lines = [l.strip() for l in f if l.strip() and not l.startswith("//")]
-                if lines:
-                    progress = Progress()
-                    progress.account = account
-                    self.accounts[account] = (lines[0], progress)
-                else:
-                    console.log(f"[bold yellow]⚠ {cf} is empty, skipping[/]")
+    def load_sessions(self):
+        """Load all previously saved sessions from disk."""
+        for session in load_saved_sessions():
+            aid = session.apple_id
+            if aid not in self.accounts:
+                progress = Progress()
+                progress.account = aid
+                self.accounts[aid] = (session, progress)
+                console.log(f"  • {aid} [dim]({session.status})[/]")
 
-    # ── control ──────────────────────────────────────────────
+    async def add_account(self, apple_id: str, password: str, domain: str = "cn") -> str:
+        """
+        Add an account and perform SRP authentication.
+        Returns: "ok", "2fa_required", or error string.
+        """
+        # Check if already exists
+        if apple_id in self.accounts:
+            session, _ = self.accounts[apple_id]
+            # Re-authenticate with new password
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, session.authenticate, password
+            )
+            return result
 
-    async def start_account(self, account: str, count: int):
-        """Start fresh generation (resets progress)."""
-        if account not in self.accounts:
+        session = ICloudSession(apple_id, domain=domain)
+        progress = Progress()
+        progress.account = apple_id
+        self.accounts[apple_id] = (session, progress)
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, session.authenticate, password)
+        console.log(f"[bold]Auth[/] {apple_id}: {result}")
+        return result
+
+    async def verify_2fa(self, apple_id: str, code: str) -> str:
+        """
+        Submit 2FA code for an account.
+        Returns: "ok" or error string.
+        """
+        if apple_id not in self.accounts:
+            return "Account not found"
+
+        session, _ = self.accounts[apple_id]
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, session.validate_2fa_code, code)
+        console.log(f"[bold]2FA[/] {apple_id}: {result}")
+        return result
+
+    async def remove_account(self, apple_id: str) -> bool:
+        """Remove an account and its session files."""
+        if apple_id not in self.accounts:
             return False
 
-        await self._cancel_task(account)
+        await self._cancel_task(apple_id)
+        session, _ = self.accounts[apple_id]
+        session.remove()
+        del self.accounts[apple_id]
+        console.log(f"[bold]Removed[/] {apple_id}")
+        return True
 
-        cookie, progress = self.accounts[account]
+    # ── generation control ───────────────────────────────────
+
+    async def start_account(self, apple_id: str, count: int):
+        """Start fresh generation (resets progress)."""
+        if apple_id not in self.accounts:
+            return "Account not found"
+
+        # Ensure authentication is valid first
+        session, progress = self.accounts[apple_id]
+        loop = asyncio.get_event_loop()
+        auth_result = await loop.run_in_executor(
+            None, session.ensure_authenticated
+        )
+        if auth_result != "ok":
+            progress.status = "error"
+            progress.message = f"Auth: {auth_result}"
+            return auth_result
+
+        await self._cancel_task(apple_id)
+
         progress.reset(count)
 
         stop_event = asyncio.Event()
-        self._stop_events[account] = stop_event
+        self._stop_events[apple_id] = stop_event
 
         task = asyncio.create_task(
-            self._run(account, cookie, count, progress, stop_event)
+            self._run(apple_id, session, count, progress, stop_event)
         )
-        self._tasks[account] = task
-        return True
+        self._tasks[apple_id] = task
+        return "ok"
 
-    async def stop_account(self, account: str):
+    async def stop_account(self, apple_id: str):
         """Signal a running account to stop."""
-        if account in self._stop_events:
-            self._stop_events[account].set()
+        if apple_id in self._stop_events:
+            self._stop_events[apple_id].set()
         return True
 
-    async def resume_account(self, account: str):
+    async def resume_account(self, apple_id: str):
         """Resume a stopped account from where it left off."""
-        if account not in self.accounts:
-            return False
+        if apple_id not in self.accounts:
+            return "Account not found"
 
-        cookie, progress = self.accounts[account]
+        session, progress = self.accounts[apple_id]
         remaining = progress.target - progress.completed
         if remaining <= 0:
-            return False
+            return "Nothing to resume"
+
+        # Re-check auth
+        loop = asyncio.get_event_loop()
+        auth_result = await loop.run_in_executor(
+            None, session.ensure_authenticated
+        )
+        if auth_result != "ok":
+            progress.status = "error"
+            progress.message = f"Auth: {auth_result}"
+            return auth_result
 
         stop_event = asyncio.Event()
-        self._stop_events[account] = stop_event
+        self._stop_events[apple_id] = stop_event
         progress.status = "generating"
         progress.message = "Resuming..."
 
         task = asyncio.create_task(
-            self._run(account, cookie, remaining, progress, stop_event)
+            self._run(apple_id, session, remaining, progress, stop_event)
         )
-        self._tasks[account] = task
-        return True
+        self._tasks[apple_id] = task
+        return "ok"
 
     # ── internals ────────────────────────────────────────────
 
-    async def _cancel_task(self, account: str):
+    async def _cancel_task(self, apple_id: str):
         """Cancel any existing task for an account."""
-        if account in self._stop_events:
-            self._stop_events[account].set()
-        if account in self._tasks and not self._tasks[account].done():
+        if apple_id in self._stop_events:
+            self._stop_events[apple_id].set()
+        if apple_id in self._tasks and not self._tasks[apple_id].done():
             try:
-                await asyncio.wait_for(self._tasks[account], timeout=3.0)
+                await asyncio.wait_for(self._tasks[apple_id], timeout=3.0)
             except asyncio.TimeoutError:
-                self._tasks[account].cancel()
+                self._tasks[apple_id].cancel()
                 try:
-                    await self._tasks[account]
+                    await self._tasks[apple_id]
                 except (asyncio.CancelledError, Exception):
                     pass
             except Exception:
                 pass
 
-    async def _run(self, account, cookie, count, progress, stop_event):
+    async def _run(self, apple_id, session, count, progress, stop_event):
         """Run generation for a single account in a fresh session."""
         try:
+            cookie_str = session.get_cookie_string()
+            if not cookie_str:
+                progress.status = "error"
+                progress.message = "No cookies — auth may have failed"
+                return
+
             async with RichHideMyEmail(
-                account=account, cookie_str=cookie, progress=progress
+                account=apple_id, cookie_str=cookie_str, progress=progress
             ) as hme:
                 await hme.generate(count, stop_event)
         except asyncio.CancelledError:
@@ -487,12 +560,17 @@ class GenerationManager:
         except Exception as e:
             progress.status = "error"
             progress.message = f"Error: {e}"
-            console.log(f"[bold red][{account}] Error: {e}[/]")
+            console.log(f"[bold red][{apple_id}] Error: {e}[/]")
 
     # ── serialization ────────────────────────────────────────
 
     def to_dict(self):
-        accounts = [p.to_dict() for _, (_, p) in self.accounts.items()]
+        accounts = []
+        for aid, (session, progress) in self.accounts.items():
+            d = progress.to_dict()
+            d["auth_status"] = session.status
+            accounts.append(d)
+
         total_target = sum(p.target for _, (_, p) in self.accounts.items())
         total_completed = sum(p.completed for _, (_, p) in self.accounts.items())
         return {
@@ -509,24 +587,21 @@ class GenerationManager:
 async def serve(port: int):
     """Start the web dashboard server (all control via UI)."""
     manager = GenerationManager()
-    manager.discover()
-
-    if not manager.accounts:
-        console.log("[bold red]❌ No cookies-*.txt files found![/]")
-        console.log("[dim]Create files like: cookies-myaccount@gmail.com.txt[/]")
-        console.log("[dim]Each file should contain the iCloud cookie string.[/]")
-        return
 
     console.rule("[bold]HideMyEmail Generator[/]")
-    console.log(f"Found [bold]{len(manager.accounts)}[/] account(s):")
-    for acc in manager.accounts:
-        console.log(f"  • {acc}")
+    console.log("Loading saved sessions...")
+    manager.load_sessions()
+
+    if not manager.accounts:
+        console.log("[dim]No saved sessions. Add accounts from the dashboard.[/]")
+
     console.rule()
 
     from server import start_server
     runner = await start_server(manager, port)
     console.log(f"[bold cyan]📊 Dashboard: http://0.0.0.0:{port}[/]")
-    console.log("[dim]Control generation from the web UI. Press Ctrl+C to exit.[/]")
+    console.log("[dim]Add accounts and control generation from the web UI.[/]")
+    console.log("[dim]Press Ctrl+C to exit.[/]")
 
     try:
         while True:
@@ -541,19 +616,20 @@ async def serve(port: int):
 
 async def list_emails(active: bool, search: str) -> None:
     """List emails for the first discovered account."""
-    cookie_files = sorted(glob.glob("cookies-*.txt"))
-    if not cookie_files:
-        console.log("[bold red]No cookies-*.txt files found![/]")
+    sessions = load_saved_sessions()
+    if not sessions:
+        console.log("[bold red]No saved sessions found![/]")
+        console.log("[dim]Add an account from the dashboard first.[/]")
         return
-    cf = cookie_files[0]
-    account = cf[len("cookies-"):-len(".txt")]
-    with open(cf) as f:
-        lines = [l.strip() for l in f if l.strip() and not l.startswith("//")]
-    if not lines:
-        console.log(f"[bold red]{cf} is empty![/]")
+    s = sessions[0]
+    result = s.ensure_authenticated()
+    if result != "ok":
+        console.log(f"[bold red]Auth failed: {result}[/]")
         return
     progress = Progress()
-    progress.account = account
-    console.log(f"[dim]Listing emails for {account}[/]")
-    async with RichHideMyEmail(account=account, cookie_str=lines[0], progress=progress) as hme:
+    progress.account = s.apple_id
+    cookie_str = s.get_cookie_string()
+    async with RichHideMyEmail(
+        account=s.apple_id, cookie_str=cookie_str, progress=progress
+    ) as hme:
         await hme.list(active, search)

@@ -3,3 +3,6 @@ aiohttp>=3.9
 rich==13.7.1
 click==8.1.7
 certifi==2024.2.2
+srp>=1.0.21
+requests>=2.31
+cryptography>=42.0
