@@ -3,8 +3,7 @@
 import asyncio
 import click
 
-from main import generate
-from main import list
+import main
 
 
 @click.group()
@@ -14,13 +13,13 @@ def cli():
 
 @click.command()
 @click.option(
-    "--count", default=5, help="How many emails to generate", type=int
+    "--port", default=8080, help="Web dashboard port", type=int
 )
-def generatecommand(count: int):
-    "Generate emails"
+def serve(port: int):
+    "Start the HideMyEmail web dashboard"
     loop = asyncio.new_event_loop()
     try:
-        loop.run_until_complete(generate(count))
+        loop.run_until_complete(main.serve(port))
     except KeyboardInterrupt:
         pass
 
@@ -29,25 +28,18 @@ def generatecommand(count: int):
 @click.option(
     "--active/--inactive", default=True, help="Filter Active / Inactive emails"
 )
-@click.option("--search", default=None, help="Search emails")
+@click.option("--search", default=None, help="Search by label")
 def listcommand(active, search):
-    "List emails"
+    "List emails (uses first account found)"
     loop = asyncio.new_event_loop()
     try:
-        loop.run_until_complete(list(active, search))
+        loop.run_until_complete(main.list_emails(active, search))
     except KeyboardInterrupt:
         pass
 
 
+cli.add_command(serve, name="serve")
 cli.add_command(listcommand, name="list")
-cli.add_command(generatecommand, name="generate")
 
 if __name__ == "__main__":
     cli()
-
-if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(generate(None))
-    except KeyboardInterrupt:
-        pass

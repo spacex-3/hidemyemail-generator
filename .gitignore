@@ -3,6 +3,8 @@ venv/
 build/
 dist/
 emails.txt
+emails-*.txt
 cookie.txt
+cookies-*.txt
 **/.DS_Store
 *.spec

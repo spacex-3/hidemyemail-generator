@@ -1,140 +1,362 @@
 import asyncio
 import datetime
+import glob
 import os
+import random
+import time
 from typing import Union, List, Optional
 import re
 
-from rich.text import Text
-from rich.prompt import IntPrompt
 from rich.console import Console
 from rich.table import Table
 
 from icloud import HideMyEmail
+from icloud.hidemyemail import is_rate_limited
 
 
-MAX_CONCURRENT_TASKS = 10
+BATCH_SIZE = 2
+CYCLE_SIZE = 5
+
+SHORT_COOLDOWN_MIN = 3.0
+SHORT_COOLDOWN_MAX = 5.0
+
+LONG_COOLDOWN_MIN = 40
+LONG_COOLDOWN_MAX = 45
+
+console = Console()
 
 
-class RichHideMyEmail(HideMyEmail):
-    _cookie_file = "cookie.txt"
+# ══════════════════════════════════════════════════════════════
+# Progress tracking
+# ══════════════════════════════════════════════════════════════
+
+class Progress:
+    """Tracks one account's generation state, readable by the web dashboard."""
 
     def __init__(self):
-        super().__init__()
-        self.console = Console()
-        self.table = Table()
+        self.account = ""
+        self.target = 0
+        self.completed = 0
+        self.emails = []
+        self.status = "idle"
+        self.fingerprint = ""
+        self.cooldown_end = 0
+        self.message = ""
+        self.errors = 0
+        self.success_in_cycle = 0
+        self.cycle_size = CYCLE_SIZE
+        self.started_at = 0
 
-        if os.path.exists(self._cookie_file):
-            # load in a cookie string from file
-            with open(self._cookie_file, "r") as f:
-                self.cookies = [line for line in f if not line.startswith("//")][0]
-        else:
-            self.console.log(
-                '[bold yellow][WARN][/] No "cookie.txt" file found! Generation might not work due to unauthorized access.'
-            )
+    def to_dict(self):
+        return {
+            "account": self.account,
+            "target": self.target,
+            "completed": self.completed,
+            "emails": self.emails[:],
+            "status": self.status,
+            "fingerprint": self.fingerprint,
+            "cooldown_end": self.cooldown_end,
+            "message": self.message,
+            "errors": self.errors,
+            "success_in_cycle": self.success_in_cycle,
+            "cycle_size": self.cycle_size,
+            "started_at": self.started_at,
+        }
+
+    def reset(self, target: int):
+        """Reset for a fresh generation run."""
+        self.target = target
+        self.completed = 0
+        self.emails = []
+        self.errors = 0
+        self.success_in_cycle = 0
+        self.started_at = 0
+        self.cooldown_end = 0
+        self.message = ""
+        self.status = "idle"
+        self.fingerprint = ""
+
+
+# ══════════════════════════════════════════════════════════════
+# HideMyEmail wrapper with rich logging
+# ══════════════════════════════════════════════════════════════
+
+class RichHideMyEmail(HideMyEmail):
+
+    def __init__(self, account: str, cookie_str: str, progress: Progress):
+        super().__init__()
+        self.account = account
+        self.table = Table()
+        self._rate_limited = False
+        self.progress = progress
+        self._email_file = f"emails-{account}.txt"
+        self.cookies = cookie_str
+
+    @property
+    def _tag(self):
+        a = self.account
+        if len(a) > 18:
+            a = a[:16] + ".."
+        return f"[bold cyan][{a}][/]"
+
+    # ── single email ─────────────────────────────────────────
 
     async def _generate_one(self) -> Union[str, None]:
-        # First, generate an email
+        if self._rate_limited:
+            return None
+
+        self.progress.message = "Generating email..."
         gen_res = await self.generate_email()
 
         if not gen_res:
+            self.progress.errors += 1
             return
-        elif "success" not in gen_res or not gen_res["success"]:
-            error = gen_res["error"] if "error" in gen_res else {}
+
+        if is_rate_limited(gen_res):
+            self._rate_limited = True
+            console.log(f"{self._tag} [bold yellow][RATE LIMIT][/] Generate blocked")
+            return
+
+        if "success" not in gen_res or not gen_res["success"]:
+            error = gen_res.get("error", {})
             err_msg = "Unknown"
-            if type(error) == int and "reason" in gen_res:
+            if isinstance(error, int) and "reason" in gen_res:
                 err_msg = gen_res["reason"]
-            elif type(error) == dict and "errorMessage" in error:
+            elif isinstance(error, dict) and "errorMessage" in error:
                 err_msg = error["errorMessage"]
-            self.console.log(
-                f"[bold red][ERR][/] - Failed to generate email. Reason: {err_msg}"
-            )
+            console.log(f"{self._tag} [bold red][ERR][/] Generate failed: {err_msg}")
+            self.progress.errors += 1
             return
 
         email = gen_res["result"]["hme"]
-        self.console.log(f'[50%] "{email}" - Successfully generated')
+        console.log(f'{self._tag} [50%] "{email}" - Generated')
 
-        # Then, reserve it
+        if self._rate_limited:
+            return None
+
+        self.progress.message = f'Reserving "{email}"...'
         reserve_res = await self.reserve_email(email)
 
         if not reserve_res:
+            self.progress.errors += 1
             return
-        elif "success" not in reserve_res or not reserve_res["success"]:
-            error = reserve_res["error"] if "error" in reserve_res else {}
-            err_msg = "Unknown"
-            if type(error) == int and "reason" in reserve_res:
-                err_msg = reserve_res["reason"]
-            elif type(error) == dict and "errorMessage" in error:
-                err_msg = error["errorMessage"]
-            self.console.log(
-                f'[bold red][ERR][/] "{email}" - Failed to reserve email. Reason: {err_msg}'
+
+        if is_rate_limited(reserve_res):
+            self._rate_limited = True
+            console.log(
+                f'{self._tag} [bold yellow][RATE LIMIT][/] "{email}" - Reserve blocked'
             )
             return
 
-        self.console.log(f'[100%] "{email}" - Successfully reserved')
+        if "success" not in reserve_res or not reserve_res["success"]:
+            error = reserve_res.get("error", {})
+            err_msg = "Unknown"
+            if isinstance(error, int) and "reason" in reserve_res:
+                err_msg = reserve_res["reason"]
+            elif isinstance(error, dict) and "errorMessage" in error:
+                err_msg = error["errorMessage"]
+            console.log(
+                f'{self._tag} [bold red][ERR][/] "{email}" - Reserve failed: {err_msg}'
+            )
+            self.progress.errors += 1
+            return
+
+        console.log(f'{self._tag} [100%] "{email}" - Reserved ✓')
         return email
 
-    async def _generate(self, num: int):
-        tasks = []
-        for _ in range(num):
-            task = asyncio.ensure_future(self._generate_one())
-            tasks.append(task)
+    # ── batch ────────────────────────────────────────────────
 
-        return filter(lambda e: e is not None, await asyncio.gather(*tasks))
+    async def _generate_batch(self, count: int):
+        tasks = [asyncio.ensure_future(self._generate_one()) for _ in range(count)]
+        results = await asyncio.gather(*tasks)
+        return [e for e in results if e is not None]
 
-    async def generate(self, count: Optional[int]) -> List[str]:
+    def _save_emails(self, emails: List[str]):
+        if emails:
+            with open(self._email_file, "a+") as f:
+                f.write(os.linesep.join(emails) + os.linesep)
+
+    # ── cooldown ─────────────────────────────────────────────
+
+    async def _long_cooldown(self, reason: str, stop_event: asyncio.Event = None):
+        """Returns True if stopped during cooldown."""
+        cooldown_minutes = random.randint(LONG_COOLDOWN_MIN, LONG_COOLDOWN_MAX)
+        total_seconds = cooldown_minutes * 60
+
+        self.progress.status = "long_cooldown"
+        self.progress.cooldown_end = time.time() + total_seconds
+        self.progress.message = f"{reason} — {cooldown_minutes} min cooldown"
+
+        console.log(
+            f"{self._tag} [bold yellow]⏳ {reason}. "
+            f"Pausing {cooldown_minutes} min...[/]"
+        )
+
+        for elapsed in range(total_seconds):
+            if stop_event and stop_event.is_set():
+                self.progress.cooldown_end = 0
+                self.progress.status = "stopped"
+                self.progress.message = (
+                    f"Stopped during cooldown. {self.progress.completed} saved."
+                )
+                console.log(f"{self._tag} [yellow]Stopped during cooldown[/]")
+                return True
+
+            remaining_s = total_seconds - elapsed
+            mins, _ = divmod(remaining_s, 60)
+            if elapsed % 300 == 0 and elapsed > 0:
+                console.log(f"{self._tag} [dim]⏳ {mins}m remaining...[/]")
+            await asyncio.sleep(1)
+
+        self.progress.cooldown_end = 0
+        console.log(f"{self._tag} [bold green]✓ Cooldown complete[/]")
+
+        self.progress.status = "rotating"
+        self.progress.message = "Rotating browser fingerprint..."
+        await self.rotate_session()
+        self.progress.fingerprint = self.browser_fingerprint
+        console.log(
+            f"{self._tag} [bold green]🔄 New fingerprint: "
+            f"{self.browser_fingerprint}[/]"
+        )
+        return False
+
+    # ── main generation loop ─────────────────────────────────
+
+    async def generate(self, count: int, stop_event: asyncio.Event = None):
+        """Generate `count` emails, appending to existing progress."""
         try:
-            emails = []
-            self.console.rule()
-            if count is None:
-                s = IntPrompt.ask(
-                    Text.assemble(("How many iCloud emails you want to generate?")),
-                    console=self.console,
-                )
+            if self.progress.started_at == 0:
+                self.progress.started_at = time.time()
+            self.progress.fingerprint = self.browser_fingerprint
+            self.progress.status = "generating"
 
-                count = int(s)
-            self.console.log(f"Generating {count} email(s)...")
-            self.console.rule()
+            console.log(
+                f"{self._tag} Starting: {count} emails | "
+                f"FP: {self.browser_fingerprint} | "
+                f"Batch: {BATCH_SIZE} | Cycle: {CYCLE_SIZE}"
+            )
 
-            with self.console.status(f"[bold green]Generating iCloud email(s)..."):
-                while count > 0:
-                    batch = await self._generate(
-                        count if count < MAX_CONCURRENT_TASKS else MAX_CONCURRENT_TASKS
+            remaining = count
+            success_in_cycle = self.progress.success_in_cycle
+            batch_num = 0
+
+            while remaining > 0:
+                # ── stop check ──
+                if stop_event and stop_event.is_set():
+                    self.progress.status = "stopped"
+                    self.progress.message = (
+                        f"Stopped. {self.progress.completed} emails saved."
                     )
-                    count -= MAX_CONCURRENT_TASKS
-                    emails += batch
+                    console.log(f"{self._tag} [yellow]Stopped by user[/]")
+                    return
 
-            if len(emails) > 0:
-                with open("emails.txt", "a+") as f:
-                    f.write(os.linesep.join(emails) + os.linesep)
+                cycle_room = max(1, CYCLE_SIZE - success_in_cycle)
+                batch_size = min(BATCH_SIZE, remaining, cycle_room)
+                batch_num += 1
 
-                self.console.rule()
-                self.console.log(
-                    f':star: Emails have been saved into the "emails.txt" file'
+                # ── short cooldown ──
+                if batch_num > 1:
+                    cd = random.uniform(SHORT_COOLDOWN_MIN, SHORT_COOLDOWN_MAX)
+                    self.progress.status = "short_cooldown"
+                    self.progress.cooldown_end = time.time() + cd
+                    self.progress.message = f"Short cooldown ({cd:.1f}s)"
+                    await asyncio.sleep(cd)
+                    self.progress.cooldown_end = 0
+
+                    if stop_event and stop_event.is_set():
+                        self.progress.status = "stopped"
+                        self.progress.message = (
+                            f"Stopped. {self.progress.completed} emails saved."
+                        )
+                        console.log(f"{self._tag} [yellow]Stopped by user[/]")
+                        return
+
+                # ── generate batch ──
+                self.progress.status = "generating"
+                self.progress.message = (
+                    f"Batch #{batch_num} "
+                    f"({batch_size} email{'s' if batch_size > 1 else ''})..."
                 )
+                self._rate_limited = False
 
-                self.console.log(
-                    f"[bold green]All done![/] Successfully generated [bold green]{len(emails)}[/] email(s)"
-                )
+                batch = await self._generate_batch(batch_size)
 
-            return emails
-        except KeyboardInterrupt:
-            return []
+                if batch:
+                    self._save_emails(batch)
+                    self.progress.emails.extend(batch)
+                    self.progress.completed += len(batch)
+                    remaining -= len(batch)
+                    success_in_cycle += len(batch)
+                    self.progress.success_in_cycle = success_in_cycle
+
+                    console.log(
+                        f"{self._tag} [dim]💾 Saved {len(batch)}. "
+                        f"Total: {self.progress.completed}/{self.progress.target} | "
+                        f"Cycle: {success_in_cycle}/{CYCLE_SIZE}[/]"
+                    )
+
+                # ── rate limited ──
+                if self._rate_limited:
+                    if remaining > 0:
+                        console.log(
+                            f"{self._tag} [bold yellow]⚠ Rate limited. "
+                            f"{remaining} remaining[/]"
+                        )
+                        was_stopped = await self._long_cooldown(
+                            "Rate limited by Apple", stop_event
+                        )
+                        if was_stopped:
+                            return
+                        success_in_cycle = 0
+                        self.progress.success_in_cycle = 0
+                        batch_num = 0
+
+                # ── proactive cycle cooldown ──
+                elif success_in_cycle >= CYCLE_SIZE and remaining > 0:
+                    console.log(
+                        f"{self._tag} [bold cyan]🔄 Cycle done "
+                        f"({success_in_cycle} emails). Rotating...[/]"
+                    )
+                    was_stopped = await self._long_cooldown(
+                        f"Cycle complete ({success_in_cycle} emails)", stop_event
+                    )
+                    if was_stopped:
+                        return
+                    success_in_cycle = 0
+                    self.progress.success_in_cycle = 0
+                    batch_num = 0
+
+            # ── done ──
+            self.progress.status = "done"
+            self.progress.message = f"All {self.progress.completed} emails done!"
+            console.log(
+                f"{self._tag} [bold green]✅ Done! "
+                f"{self.progress.completed} emails → {self._email_file}[/]"
+            )
+
+        except asyncio.CancelledError:
+            self.progress.status = "stopped"
+            self.progress.message = "Task cancelled"
+        except Exception as e:
+            self.progress.status = "error"
+            self.progress.message = f"Error: {e}"
+            console.log(f"{self._tag} [bold red]Error: {e}[/]")
+
+    # ── list command ─────────────────────────────────────────
 
     async def list(self, active: bool, search: str) -> None:
         gen_res = await self.list_email()
         if not gen_res:
             return
-
         if "success" not in gen_res or not gen_res["success"]:
-            error = gen_res["error"] if "error" in gen_res else {}
+            error = gen_res.get("error", {})
             err_msg = "Unknown"
-            if type(error) == int and "reason" in gen_res:
+            if isinstance(error, int) and "reason" in gen_res:
                 err_msg = gen_res["reason"]
-            elif type(error) == dict and "errorMessage" in error:
+            elif isinstance(error, dict) and "errorMessage" in error:
                 err_msg = error["errorMessage"]
-            self.console.log(
-                f"[bold red][ERR][/] - Failed to generate email. Reason: {err_msg}"
-            )
+            console.log(f"[bold red][ERR][/] Failed to list: {err_msg}")
             return
 
         self.table.add_column("Label")
@@ -144,7 +366,7 @@ class RichHideMyEmail(HideMyEmail):
 
         for row in gen_res["result"]["hmeEmails"]:
             if row["isActive"] == active:
-                if search is not None and re.search(search, row["label"]):
+                if search is None or re.search(search, row["label"]):
                     self.table.add_row(
                         row["label"],
                         row["hme"],
@@ -155,34 +377,183 @@ class RichHideMyEmail(HideMyEmail):
                         ),
                         str(row["isActive"]),
                     )
+        console.print(self.table)
+
+
+# ══════════════════════════════════════════════════════════════
+# Generation Manager  — controllable via web UI
+# ══════════════════════════════════════════════════════════════
+
+class GenerationManager:
+    """Manages multi-account generation with start/stop/resume per account."""
+
+    def __init__(self):
+        self.accounts = {}       # account_name -> (cookie_str, Progress)
+        self._tasks = {}         # account_name -> asyncio.Task
+        self._stop_events = {}   # account_name -> asyncio.Event
+
+    # ── discovery ────────────────────────────────────────────
+
+    def discover(self):
+        """Scan for cookies-*.txt files and populate accounts."""
+        cookie_files = sorted(glob.glob("cookies-*.txt"))
+        for cf in cookie_files:
+            account = cf[len("cookies-"):-len(".txt")]
+            with open(cf) as f:
+                lines = [l.strip() for l in f if l.strip() and not l.startswith("//")]
+                if lines:
+                    progress = Progress()
+                    progress.account = account
+                    self.accounts[account] = (lines[0], progress)
                 else:
-                    self.table.add_row(
-                        row["label"],
-                        row["hme"],
-                        str(
-                            datetime.datetime.fromtimestamp(
-                                row["createTimestamp"] / 1000
-                            )
-                        ),
-                        str(row["isActive"]),
-                    )
+                    console.log(f"[bold yellow]⚠ {cf} is empty, skipping[/]")
 
-        self.console.print(self.table)
+    # ── control ──────────────────────────────────────────────
+
+    async def start_account(self, account: str, count: int):
+        """Start fresh generation (resets progress)."""
+        if account not in self.accounts:
+            return False
+
+        await self._cancel_task(account)
+
+        cookie, progress = self.accounts[account]
+        progress.reset(count)
+
+        stop_event = asyncio.Event()
+        self._stop_events[account] = stop_event
+
+        task = asyncio.create_task(
+            self._run(account, cookie, count, progress, stop_event)
+        )
+        self._tasks[account] = task
+        return True
+
+    async def stop_account(self, account: str):
+        """Signal a running account to stop."""
+        if account in self._stop_events:
+            self._stop_events[account].set()
+        return True
+
+    async def resume_account(self, account: str):
+        """Resume a stopped account from where it left off."""
+        if account not in self.accounts:
+            return False
+
+        cookie, progress = self.accounts[account]
+        remaining = progress.target - progress.completed
+        if remaining <= 0:
+            return False
+
+        stop_event = asyncio.Event()
+        self._stop_events[account] = stop_event
+        progress.status = "generating"
+        progress.message = "Resuming..."
+
+        task = asyncio.create_task(
+            self._run(account, cookie, remaining, progress, stop_event)
+        )
+        self._tasks[account] = task
+        return True
+
+    # ── internals ────────────────────────────────────────────
+
+    async def _cancel_task(self, account: str):
+        """Cancel any existing task for an account."""
+        if account in self._stop_events:
+            self._stop_events[account].set()
+        if account in self._tasks and not self._tasks[account].done():
+            try:
+                await asyncio.wait_for(self._tasks[account], timeout=3.0)
+            except asyncio.TimeoutError:
+                self._tasks[account].cancel()
+                try:
+                    await self._tasks[account]
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except Exception:
+                pass
+
+    async def _run(self, account, cookie, count, progress, stop_event):
+        """Run generation for a single account in a fresh session."""
+        try:
+            async with RichHideMyEmail(
+                account=account, cookie_str=cookie, progress=progress
+            ) as hme:
+                await hme.generate(count, stop_event)
+        except asyncio.CancelledError:
+            progress.status = "stopped"
+            progress.message = "Task cancelled"
+        except Exception as e:
+            progress.status = "error"
+            progress.message = f"Error: {e}"
+            console.log(f"[bold red][{account}] Error: {e}[/]")
+
+    # ── serialization ────────────────────────────────────────
+
+    def to_dict(self):
+        accounts = [p.to_dict() for _, (_, p) in self.accounts.items()]
+        total_target = sum(p.target for _, (_, p) in self.accounts.items())
+        total_completed = sum(p.completed for _, (_, p) in self.accounts.items())
+        return {
+            "accounts": accounts,
+            "total_target": total_target,
+            "total_completed": total_completed,
+        }
 
 
-async def generate(count: Optional[int]) -> None:
-    async with RichHideMyEmail() as hme:
-        await hme.generate(count)
+# ══════════════════════════════════════════════════════════════
+# Entry points
+# ══════════════════════════════════════════════════════════════
 
+async def serve(port: int):
+    """Start the web dashboard server (all control via UI)."""
+    manager = GenerationManager()
+    manager.discover()
 
-async def list(active: bool, search: str) -> None:
-    async with RichHideMyEmail() as hme:
-        await hme.list(active, search)
+    if not manager.accounts:
+        console.log("[bold red]❌ No cookies-*.txt files found![/]")
+        console.log("[dim]Create files like: cookies-myaccount@gmail.com.txt[/]")
+        console.log("[dim]Each file should contain the iCloud cookie string.[/]")
+        return
 
+    console.rule("[bold]HideMyEmail Generator[/]")
+    console.log(f"Found [bold]{len(manager.accounts)}[/] account(s):")
+    for acc in manager.accounts:
+        console.log(f"  • {acc}")
+    console.rule()
 
-if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
+    from server import start_server
+    runner = await start_server(manager, port)
+    console.log(f"[bold cyan]📊 Dashboard: http://0.0.0.0:{port}[/]")
+    console.log("[dim]Control generation from the web UI. Press Ctrl+C to exit.[/]")
+
     try:
-        loop.run_until_complete(generate(None))
+        while True:
+            await asyncio.sleep(1)
     except KeyboardInterrupt:
         pass
+    finally:
+        for acc in list(manager.accounts.keys()):
+            await manager._cancel_task(acc)
+        await runner.cleanup()
+
+
+async def list_emails(active: bool, search: str) -> None:
+    """List emails for the first discovered account."""
+    cookie_files = sorted(glob.glob("cookies-*.txt"))
+    if not cookie_files:
+        console.log("[bold red]No cookies-*.txt files found![/]")
+        return
+    cf = cookie_files[0]
+    account = cf[len("cookies-"):-len(".txt")]
+    with open(cf) as f:
+        lines = [l.strip() for l in f if l.strip() and not l.startswith("//")]
+    if not lines:
+        console.log(f"[bold red]{cf} is empty![/]")
+        return
+    progress = Progress()
+    progress.account = account
+    console.log(f"[dim]Listing emails for {account}[/]")
+    async with RichHideMyEmail(account=account, cookie_str=lines[0], progress=progress) as hme:
+        await hme.list(active, search)

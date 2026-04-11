@@ -1,7 +1,127 @@
 import asyncio
-import aiohttp
-import ssl
-import certifi
+import random
+
+from curl_cffi.requests import AsyncSession
+
+
+# Browser fingerprint profiles — Safari-heavy since it's the most natural
+# client for iCloud. Each entry: (impersonate_target, matching_headers)
+BROWSER_PROFILES = [
+    {
+        "impersonate": "safari15_3",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.3 Safari/605.1.15",
+        "sec_ch_ua": None,  # Safari doesn't send sec-ch-ua
+        "sec_ch_ua_mobile": None,
+        "sec_ch_ua_platform": None,
+    },
+    {
+        "impersonate": "safari17_0",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "sec_ch_ua_mobile": None,
+        "sec_ch_ua_platform": None,
+    },
+    {
+        "impersonate": "safari18_0",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "sec_ch_ua_mobile": None,
+        "sec_ch_ua_platform": None,
+    },
+    {
+        "impersonate": "chrome124",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_platform": '"macOS"',
+    },
+    {
+        "impersonate": "chrome131",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
+        "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_platform": '"macOS"',
+    },
+]
+
+# Accept-Language variants to add diversity
+_LANG_VARIANTS = [
+    "en-US,en;q=0.9",
+    "en-US,en;q=0.8",
+    "en-GB,en-US;q=0.9,en;q=0.8",
+    "en-US,en-GB;q=0.9,en;q=0.7",
+    "en,en-US;q=0.9",
+    "en-US,en;q=0.9,zh-CN;q=0.8",
+    "en-US,en;q=0.9,ja;q=0.8",
+]
+
+# Random delay range (seconds) injected before each API call
+MIN_DELAY = 1.0
+MAX_DELAY = 4.0
+
+# Keywords that indicate Apple's rate limiting
+_RATE_LIMIT_KEYWORDS = [
+    "reached the limit",
+    "rate limit",
+    "try again later",
+]
+
+
+def is_rate_limited(response: dict) -> bool:
+    """Check if an API response indicates Apple's rate limiting."""
+    if not response:
+        return False
+    if response.get("success"):
+        return False
+
+    # Extract error message from various response formats
+    error = response.get("error", {})
+    reason = ""
+    if isinstance(error, int) and "reason" in response:
+        reason = response["reason"]
+    elif isinstance(error, dict) and "errorMessage" in error:
+        reason = error["errorMessage"]
+
+    reason_lower = reason.lower()
+    return any(kw in reason_lower for kw in _RATE_LIMIT_KEYWORDS)
+
+
+def _pick_profile() -> dict:
+    """Pick a random browser profile and return assembled headers."""
+    profile = random.choice(BROWSER_PROFILES)
+    lang = random.choice(_LANG_VARIANTS)
+
+    headers = {
+        "Connection": "keep-alive",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "User-Agent": profile["user_agent"],
+        "Content-Type": "text/plain",
+        "Accept": "*/*",
+        "Origin": "https://www.icloud.com",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Referer": "https://www.icloud.com/",
+        "Accept-Language": lang,
+    }
+
+    # Chrome-family browsers send sec-ch-ua headers; Safari does not
+    if profile["sec_ch_ua"] is not None:
+        headers["sec-ch-ua"] = profile["sec_ch_ua"]
+        headers["sec-ch-ua-mobile"] = profile["sec_ch_ua_mobile"]
+        headers["sec-ch-ua-platform"] = profile["sec_ch_ua_platform"]
+        headers["Sec-GPC"] = "1"
+
+    return {
+        "impersonate": profile["impersonate"],
+        "headers": headers,
+    }
+
+
+async def _human_delay():
+    """Sleep for a random duration to mimic human interaction pacing."""
+    await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
 
 class HideMyEmail:
@@ -28,29 +148,17 @@ class HideMyEmail:
         self.cookies = cookies
 
     async def __aenter__(self):
-        connector = aiohttp.TCPConnector(ssl_context=ssl.create_default_context(cafile=certifi.where())) 
-        self.s = aiohttp.ClientSession(
-            headers={
-                "Connection": "keep-alive",
-                "Pragma": "no-cache",
-                "Cache-Control": "no-cache",
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-                "Content-Type": "text/plain",
-                "Accept": "*/*",
-                "Sec-GPC": "1",
-                "Origin": "https://www.icloud.com",
-                "Sec-Fetch-Site": "same-site",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
-                "Referer": "https://www.icloud.com/",
-                "Accept-Language": "en-US,en-GB;q=0.9,en;q=0.8,cs;q=0.7",
-                "sec-ch-ua": '"Brave";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"macOS"',
-                "Cookie": self.__cookies.strip(),
-            },
-            timeout=aiohttp.ClientTimeout(total=10),
-            connector=connector,
+        # Pick a random browser profile for this session
+        profile = _pick_profile()
+        self._impersonate = profile["impersonate"]
+
+        headers = profile["headers"]
+        headers["Cookie"] = self.__cookies.strip()
+
+        self.s = AsyncSession(
+            headers=headers,
+            impersonate=self._impersonate,
+            timeout=30,
         )
 
         return self
@@ -67,14 +175,40 @@ class HideMyEmail:
         # remove new lines/whitespace for security reasons
         self.__cookies = cookies.strip()
 
+    @property
+    def browser_fingerprint(self) -> str:
+        """Return the current browser impersonation target name."""
+        return getattr(self, "_impersonate", "unknown")
+
+    async def rotate_session(self):
+        """Close current session and open a new one with a different browser fingerprint.
+
+        Used after rate-limit cooldowns to present a different TLS/header fingerprint.
+        """
+        await self.s.close()
+
+        profile = _pick_profile()
+        self._impersonate = profile["impersonate"]
+
+        headers = profile["headers"]
+        headers["Cookie"] = self.cookies.strip()
+
+        self.s = AsyncSession(
+            headers=headers,
+            impersonate=self._impersonate,
+            timeout=30,
+        )
+
     async def generate_email(self) -> dict:
         """Generates an email"""
         try:
-            async with self.s.post(
-                f"{self.base_url_v1}/generate", params=self.params, json={"langCode": "en-us"}
-            ) as resp:
-                res = await resp.json()
-                return res
+            await _human_delay()
+            resp = await self.s.post(
+                f"{self.base_url_v1}/generate",
+                params=self.params,
+                json={"langCode": "en-us"},
+            )
+            return resp.json()
         except asyncio.TimeoutError:
             return {"error": 1, "reason": "Request timed out"}
         except Exception as e:
@@ -83,16 +217,18 @@ class HideMyEmail:
     async def reserve_email(self, email: str) -> dict:
         """Reserves an email and registers it for forwarding"""
         try:
+            await _human_delay()
             payload = {
                 "hme": email,
                 "label": self.label,
                 "note": "Generated by rtuna's iCloud email generator",
             }
-            async with self.s.post(
-                f"{self.base_url_v1}/reserve", params=self.params, json=payload
-            ) as resp:
-                res = await resp.json()
-            return res
+            resp = await self.s.post(
+                f"{self.base_url_v1}/reserve",
+                params=self.params,
+                json=payload,
+            )
+            return resp.json()
         except asyncio.TimeoutError:
             return {"error": 1, "reason": "Request timed out"}
         except Exception as e:
@@ -101,11 +237,9 @@ class HideMyEmail:
     async def list_email(self) -> dict:
         """List all HME"""
         try:
-            async with self.s.get(f"{self.base_url_v2}/list", params=self.params) as resp:
-                res = await resp.json()
-                return res
+            resp = await self.s.get(f"{self.base_url_v2}/list", params=self.params)
+            return resp.json()
         except asyncio.TimeoutError:
             return {"error": 1, "reason": "Request timed out"}
         except Exception as e:
             return {"error": 1, "reason": str(e)}
-
