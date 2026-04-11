@@ -310,7 +310,20 @@ class RichHideMyEmail(HideMyEmail):
                 )
                 self._rate_limited = False
 
-                batch = await self._generate_batch(batch_size)
+                try:
+                    batch = await asyncio.wait_for(
+                        self._generate_batch(batch_size), 
+                        timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    console.log(
+                        f"{self._tag} [bold red]⚠ Generation timed out (Apple blocked IP). Treating as Rate Limit.[/]"
+                    )
+                    self._rate_limited = True
+                    batch = []
+                except Exception as e:
+                    console.log(f"{self._tag} [bold red]⚠ Generation error: {e}[/]")
+                    batch = []
 
                 if batch:
                     self._save_emails(batch)
