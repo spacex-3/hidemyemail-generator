@@ -294,6 +294,7 @@ function mk(a,i){
             </div>
             <span class="badge"><span class="dot" id="d${i}"></span> <span id="s${i}">Idle</span></span>
             <span class="acct-fp" id="f${i}">—</span>
+            <span class="auth-del" id="del${i}" onclick="removeA(${i})" style="display:none" title="删除此账号">✕</span>
         </div>
         <!-- 2FA inline -->
         <div class="auth-row" id="2fa${i}" style="display:none">
@@ -378,6 +379,9 @@ function up(a,i){
 
     // Fingerprint
     st('f'+i, isAuth?(a.fingerprint||'—'):'—');
+
+    // Delete button — show when not running
+    sh('del'+i, isAuth && !run);
 
     // Progress
     const p=a.target>0?(a.completed/a.target*100):0;

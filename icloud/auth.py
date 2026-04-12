@@ -363,6 +363,30 @@ class ICloudSession:
 
             if resp.status_code == 400:
                 return "Invalid verification code"
+
+            if resp.status_code == 412:
+                # Apple requires privacy/terms acceptance — attempt repair
+                logger.info("2FA got 412, attempting repair flow...")
+                h2 = self._get_auth_headers()
+                try:
+                    resp2 = self.session.post(
+                        f"{self.AUTH_ENDPOINT}/repair/complete",
+                        json={}, headers=h2,
+                    )
+                    self._capture_headers(resp2)
+                    logger.info(f"Repair response: {resp2.status_code}")
+                except Exception as e:
+                    logger.warning(f"Repair request failed: {e}")
+
+                # Proceed to trust + token anyway
+                self._trust_session()
+                self._authenticate_with_token()
+
+                self.session_data["requires_2fa"] = False
+                self.session_data["authenticated"] = True
+                self._save_session()
+                return "ok"
+
             if resp.status_code >= 400:
                 return f"Verification failed (HTTP {resp.status_code})"
 
