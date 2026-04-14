@@ -23,6 +23,9 @@ This creates an obvious repeated pattern and also carries the wrong project bran
 - No persistence of generated labels/notes across runs.
 - No UI control for custom metadata patterns in this change.
 - No large-scale refactor of generation flow outside the metadata path.
+- No changes to the core Hide My Email generation request flow.
+- No changes to iCloud login or authentication behavior.
+- No changes to session storage, saved-account persistence, or related serialization logic.
 
 ## Current Behavior
 
@@ -91,10 +94,21 @@ The README should describe the project without legacy attribution text that conf
 - Add helper(s) to generate randomized metadata.
 - Change `reserve_email()` to generate `label` and `note` per call.
 - Remove the fixed default branding-oriented metadata path.
+- Keep `generate_email()` request behavior unchanged.
 
 ### `README.md`
 
 - Remove or rewrite the remaining `rtuna` references.
+
+## Explicit Scope Guardrails
+
+This change must stay limited to metadata generation and documentation cleanup.
+
+The implementation must not modify:
+
+- the core HME address generation logic,
+- iCloud login, 2FA, or authentication flow,
+- session persistence, saved sessions, or account serialization behavior.
 
 ### `tests/test_hidemyemail_metadata.py`
 
