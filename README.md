@@ -139,4 +139,4 @@ cryptography>=42.0
 
 Licensed under the MIT License - see the [LICENSE file](./LICENSE) for more details.
 
-Originally created by **[rtuna](https://twitter.com/rtunazzz)**. SRP authentication, multi-account dashboard, and smart rate-limit handling by **[spacex-3](https://github.com/spacex-3)**.
+Maintained in this repository by **[spacex-3](https://github.com/spacex-3)**.
