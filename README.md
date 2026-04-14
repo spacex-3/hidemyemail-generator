@@ -102,6 +102,50 @@ email@icloud.com,2026-04-11 23:01:59
 another@icloud.com,2026-04-11 23:02:04
 ```
 
+## 🐳 Docker / VPS Deployment
+
+If you want to deploy on a VPS, you can run the project directly from the public GHCR image.
+
+### 1. Create `docker-compose.yml`
+
+```yaml
+services:
+  hme:
+    image: ghcr.io/spacex-3/hidemyemail-generator:latest
+    container_name: hme
+    ports:
+      - "8080:8080"
+    environment:
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+```
+
+### 2. Start the service
+
+```bash
+mkdir -p data
+docker compose up -d
+```
+
+Then open `http://<your-vps-ip>:8080` in your browser.
+
+### 3. Migrate existing generated email history
+
+If you already used the Python version before, you can copy your existing `emails-*.txt` files into the VPS `data/` directory before starting the container:
+
+```bash
+mkdir -p data
+cp emails-*.txt data/
+```
+
+The dashboard will continue loading those historical records after startup, and new generated addresses will append to the same files.
+
+### 4. Re-add accounts after migration
+
+Existing generated email history can be reused directly, but saved login sessions may not remain reusable across machines or containers. After migration, simply log in again from the dashboard. New session files will be stored under `data/sessions/`.
+
 ## 🏗️ Project Structure
 
 ```
@@ -139,4 +183,4 @@ cryptography>=42.0
 
 Licensed under the MIT License - see the [LICENSE file](./LICENSE) for more details.
 
-Originally created by **[rtuna](https://twitter.com/rtunazzz)**. SRP authentication, multi-account dashboard, and smart rate-limit handling by **[spacex-3](https://github.com/spacex-3)**.
+Maintained in this repository by **[spacex-3](https://github.com/spacex-3)**.

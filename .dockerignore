@@ -1,0 +1,15 @@
+.git
+.github
+.worktrees
+venv
+__pycache__
+**/__pycache__
+*.pyc
+sessions
+data
+emails-*.txt
+*.spec
+build
+dist
+.DS_Store
+.pytest_cache

@@ -22,11 +22,12 @@ from uuid import uuid1
 import requests
 import srp
 
+from storage_paths import get_sessions_dir
+
 from cryptography.fernet import Fernet
 
 logger = logging.getLogger(__name__)
 
-SESSIONS_DIR = "sessions"
 
 # Apple's widget/OAuth key (same for all iCloud web apps)
 WIDGET_KEY = "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d"
@@ -141,10 +142,11 @@ class ICloudSession:
         })
 
         # Persistent cookie jar + session file
-        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        sessions_dir = get_sessions_dir()
+        os.makedirs(sessions_dir, exist_ok=True)
         safe = "".join(c for c in apple_id if c.isalnum() or c in "._-@")
-        self._cookiejar_path = os.path.join(SESSIONS_DIR, f"{safe}.cookies")
-        self._session_path = os.path.join(SESSIONS_DIR, f"{safe}.session")
+        self._cookiejar_path = os.path.join(sessions_dir, f"{safe}.cookies")
+        self._session_path = os.path.join(sessions_dir, f"{safe}.session")
 
         self.session.cookies = cookielib.LWPCookieJar(filename=self._cookiejar_path)
 
@@ -514,14 +516,15 @@ class ICloudSession:
 def load_saved_sessions() -> list[ICloudSession]:
     """Load all previously saved sessions from the sessions/ directory."""
     sessions = []
-    if not os.path.exists(SESSIONS_DIR):
+    sessions_dir = get_sessions_dir()
+    if not os.path.exists(sessions_dir):
         return sessions
 
-    for fname in sorted(os.listdir(SESSIONS_DIR)):
+    for fname in sorted(os.listdir(sessions_dir)):
         if not fname.endswith(".session"):
             continue
         try:
-            with open(os.path.join(SESSIONS_DIR, fname)) as f:
+            with open(os.path.join(sessions_dir, fname)) as f:
                 data = json.load(f)
             apple_id = data.get("apple_id", "")
             domain = data.get("domain", "cn")
