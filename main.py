@@ -12,6 +12,7 @@ from rich.table import Table
 
 from icloud import HideMyEmail, is_rate_limited
 from icloud.auth import ICloudSession, load_saved_sessions
+from storage_paths import get_emails_file
 
 
 BATCH_SIZE = 2
@@ -49,7 +50,7 @@ class Progress:
         self.interval = 45
 
     def load_historical_emails(self):
-        file_path = f"emails-{self.account}.txt"
+        file_path = get_emails_file(self.account)
         self.emails = []
         if os.path.exists(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
@@ -104,7 +105,7 @@ class RichHideMyEmail(HideMyEmail):
         self.table = Table()
         self._rate_limited = False
         self.progress = progress
-        self._email_file = f"emails-{account}.txt"
+        self._email_file = get_emails_file(account)
         self.cookies = cookie_str
 
     @property
