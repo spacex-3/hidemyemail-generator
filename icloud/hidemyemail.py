@@ -124,6 +124,33 @@ async def _human_delay():
     await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
 
+def _response_body_preview(response, limit: int = 240) -> str:
+    body = getattr(response, "text", "") or ""
+    body = " ".join(str(body).split())
+    if not body:
+        return "<empty>"
+    if len(body) > limit:
+        return body[:limit] + "..."
+    return body
+
+
+def _parse_json_response(response, action: str) -> dict:
+    try:
+        return response.json()
+    except Exception:
+        headers = getattr(response, "headers", {}) or {}
+        content_type = headers.get("content-type") or headers.get("Content-Type") or "unknown"
+        status = getattr(response, "status_code", "unknown")
+        preview = _response_body_preview(response)
+        return {
+            "error": 1,
+            "reason": (
+                f"Non-JSON response during {action} "
+                f"(status={status}, content-type={content_type}, body={preview})"
+            ),
+        }
+
+
 class HideMyEmail:
     base_url_v1 = "https://p68-maildomainws.icloud.com/v1/hme"
     base_url_v2 = "https://p68-maildomainws.icloud.com/v2/hme"
@@ -210,7 +237,7 @@ class HideMyEmail:
                 params=self.params,
                 json={"langCode": "en-us"},
             )
-            return resp.json()
+            return _parse_json_response(resp, "generate_email")
         except asyncio.TimeoutError:
             return {"error": 1, "reason": "Request timed out"}
         except Exception as e:
@@ -231,7 +258,7 @@ class HideMyEmail:
                 params=self.params,
                 json=payload,
             )
-            return resp.json()
+            return _parse_json_response(resp, "reserve_email")
         except asyncio.TimeoutError:
             return {"error": 1, "reason": "Request timed out"}
         except Exception as e:
@@ -241,7 +268,7 @@ class HideMyEmail:
         """List all HME"""
         try:
             resp = await self.s.get(f"{self.base_url_v2}/list", params=self.params)
-            return resp.json()
+            return _parse_json_response(resp, "list_email")
         except asyncio.TimeoutError:
             return {"error": 1, "reason": "Request timed out"}
         except Exception as e:
