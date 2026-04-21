@@ -637,8 +637,16 @@ poll();
 async def _json_api(handler_name: str, action, *, error_key: str = "result", error_value=None):
     try:
         return await action()
-    except web.HTTPException:
-        raise
+    except web.HTTPException as exc:
+        logger.warning("API handler %s raised HTTPException: %s", handler_name, exc)
+        if callable(error_value):
+            payload = error_value(exc)
+        elif error_value is not None:
+            payload = error_value
+        else:
+            message = exc.text or exc.reason or str(exc)
+            payload = {error_key: f"Server error: {message}"}
+        return web.json_response(payload, status=exc.status)
     except Exception as exc:
         logger.exception("API handler %s failed", handler_name)
         if callable(error_value):
