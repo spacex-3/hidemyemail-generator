@@ -4,6 +4,7 @@ import glob
 import os
 import random
 import time
+import traceback
 from typing import Union, List, Optional
 import re
 
@@ -15,6 +16,28 @@ from icloud.auth import ICloudSession, load_saved_sessions
 from storage_paths import get_emails_file
 
 
+class SafeConsole(Console):
+    """Rich console wrapper that never lets stdout/stderr I/O errors crash work."""
+
+    def log(self, *args, **kwargs):
+        try:
+            return super().log(*args, **kwargs)
+        except OSError:
+            return None
+
+    def print(self, *args, **kwargs):
+        try:
+            return super().print(*args, **kwargs)
+        except OSError:
+            return None
+
+    def rule(self, *args, **kwargs):
+        try:
+            return super().rule(*args, **kwargs)
+        except OSError:
+            return None
+
+
 BATCH_SIZE = 2
 CYCLE_SIZE = 5
 
@@ -24,7 +47,37 @@ SHORT_COOLDOWN_MAX = 5.0
 LONG_COOLDOWN_MIN = 40
 LONG_COOLDOWN_MAX = 45
 
-console = Console()
+console = SafeConsole()
+
+DEBUG_LOG_PATH = os.environ.get("HME_DEBUG_LOG", "/tmp/hme-runtime.log")
+
+
+def _record_runtime_trace(context: str, exc: BaseException) -> None:
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"=== {datetime.datetime.now().isoformat()} | {context} ===\n")
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            f.write(traceback.format_exc())
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def _normalize_hme_client_id(raw_client_id: str) -> str:
+    raw_client_id = (raw_client_id or "").strip()
+    if raw_client_id.startswith("auth-"):
+        return raw_client_id[len("auth-"):]
+    return raw_client_id
+
+
+def apply_hme_session_context(hme: HideMyEmail, session: ICloudSession) -> None:
+    """Apply current Apple session bootstrap data to an HME client."""
+    hme.params["dsid"] = session.get_dsid()
+    hme.params["clientId"] = _normalize_hme_client_id(getattr(session, "client_id", ""))
+    hme.configure_service_context(
+        service_url=session.get_maildomain_service_url(),
+        home_endpoint=session.HOME_ENDPOINT,
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -409,6 +462,7 @@ class RichHideMyEmail(HideMyEmail):
             self.progress.status = "stopped"
             self.progress.message = "Task cancelled"
         except Exception as e:
+            _record_runtime_trace("RichHideMyEmail.generate", e)
             self.progress.status = "error"
             self.progress.message = f"Error: {e}"
             console.log(f"{self._tag} [bold red]Error: {e}[/]")
@@ -633,6 +687,7 @@ class GenerationManager:
     async def _run(self, apple_id, session, count, progress, stop_event):
         """Run generation for a single account in a fresh session."""
         try:
+            session.validate_token()
             cookie_str = session.get_cookie_string()
             if not cookie_str:
                 progress.status = "error"
@@ -642,11 +697,14 @@ class GenerationManager:
             async with RichHideMyEmail(
                 account=apple_id, cookie_str=cookie_str, progress=progress
             ) as hme:
+                apply_hme_session_context(hme, session)
+                await hme.rotate_session()
                 await hme.generate(count, stop_event)
         except asyncio.CancelledError:
             progress.status = "stopped"
             progress.message = "Task cancelled"
         except Exception as e:
+            _record_runtime_trace(f"GenerationManager._run({apple_id})", e)
             progress.status = "error"
             progress.message = f"Error: {e}"
             console.log(f"[bold red][{apple_id}] Error: {e}[/]")
@@ -721,4 +779,5 @@ async def list_emails(active: bool, search: str) -> None:
     async with RichHideMyEmail(
         account=s.apple_id, cookie_str=cookie_str, progress=progress
     ) as hme:
+        apply_hme_session_context(hme, s)
         await hme.list(active, search)

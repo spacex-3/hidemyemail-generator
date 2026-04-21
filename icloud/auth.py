@@ -500,7 +500,32 @@ class ICloudSession:
 
     def get_dsid(self) -> str:
         """Get DSID from auth data."""
-        return str(self.data.get("dsInfo", {}).get("dsid", ""))
+        dsid = str(self.data.get("dsInfo", {}).get("dsid", ""))
+        if dsid:
+            return dsid
+
+        cookie_jar = self.session.cookies
+        if hasattr(cookie_jar, "get"):
+            cookie_value = cookie_jar.get("X-APPLE-WEBAUTH-USER", "")
+        else:
+            cookie_value = ""
+            for cookie in cookie_jar:
+                if getattr(cookie, "name", "") == "X-APPLE-WEBAUTH-USER":
+                    cookie_value = cookie.value
+                    break
+
+        if cookie_value:
+            for part in str(cookie_value).strip('"').split(":"):
+                if part.startswith("d="):
+                    return part.partition("=")[2]
+
+        return ""
+
+    def get_maildomain_service_url(self) -> str:
+        """Return the current maildomain service URL from Apple bootstrap data."""
+        webservices = self.data.get("webservices", {}) or {}
+        service = webservices.get("premiummailsettings", {}) or {}
+        return str(service.get("url", "")).rstrip("/")
 
     # ── cleanup ──────────────────────────────────────────────
 

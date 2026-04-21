@@ -35,8 +35,8 @@ class _FakeSession:
     def __init__(self):
         self.calls = []
 
-    async def post(self, url, params=None, json=None):
-        self.calls.append({"url": url, "params": params, "json": json})
+    async def post(self, url, params=None, json=None, data=None):
+        self.calls.append({"url": url, "params": params, "json": json, "data": data})
         return _FakeResponse({"success": True})
 
 
@@ -62,20 +62,12 @@ class ReservePayloadTests(unittest.IsolatedAsyncioTestCase):
             await client.reserve_email("second@icloud.com")
 
         self.assertEqual(
-            client.s.calls[0]["json"],
-            {
-                "hme": "first@icloud.com",
-                "label": "quiet harbor",
-                "note": "Reserved for personal email routing.",
-            },
+            client.s.calls[0]["data"],
+            "{\"hme\":\"first@icloud.com\",\"label\":\"quiet harbor\",\"note\":\"Reserved for personal email routing.\"}",
         )
         self.assertEqual(
-            client.s.calls[1]["json"],
-            {
-                "hme": "second@icloud.com",
-                "label": "silver meadow",
-                "note": "Created for inbox organization.",
-            },
+            client.s.calls[1]["data"],
+            "{\"hme\":\"second@icloud.com\",\"label\":\"silver meadow\",\"note\":\"Created for inbox organization.\"}",
         )
 
 

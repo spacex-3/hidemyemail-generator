@@ -19,8 +19,8 @@ class _FakeSession:
         self.response = response
         self.calls = []
 
-    async def post(self, url, params=None, json=None):
-        self.calls.append({"url": url, "params": params, "json": json})
+    async def post(self, url, params=None, json=None, data=None):
+        self.calls.append({"url": url, "params": params, "json": json, "data": data})
         return self.response
 
 

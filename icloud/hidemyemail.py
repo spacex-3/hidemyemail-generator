@@ -1,12 +1,21 @@
 import asyncio
+import json
 import random
 
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.impersonate import BrowserTypeLiteral
 
 
 # Browser fingerprint profiles — Safari-heavy since it's the most natural
 # client for iCloud. Each entry: (impersonate_target, matching_headers)
 BROWSER_PROFILES = [
+    {
+        "impersonate": "chrome146",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "sec_ch_ua": "\"Google Chrome\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"",
+        "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_platform": "\"macOS\"",
+    },
     {
         "impersonate": "safari15_3",
         "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.3 Safari/605.1.15",
@@ -66,6 +75,9 @@ _RATE_LIMIT_KEYWORDS = [
     "try again later",
 ]
 
+_SUPPORTED_IMPERSONATIONS = set(BrowserTypeLiteral.__args__)
+_CN_CHROME_PROFILE_FALLBACKS = ("chrome146", "chrome124", "chrome131")
+
 
 def is_rate_limited(response: dict) -> bool:
     """Check if an API response indicates Apple's rate limiting."""
@@ -86,9 +98,17 @@ def is_rate_limited(response: dict) -> bool:
     return any(kw in reason_lower for kw in _RATE_LIMIT_KEYWORDS)
 
 
-def _pick_profile() -> dict:
-    """Pick a random browser profile and return assembled headers."""
-    profile = random.choice(BROWSER_PROFILES)
+def _pick_profile(preferred_impersonate: str | None = None) -> dict:
+    """Pick a browser profile and return assembled headers."""
+    if preferred_impersonate:
+        profile = next(
+            (candidate for candidate in BROWSER_PROFILES if candidate["impersonate"] == preferred_impersonate),
+            None,
+        )
+    else:
+        profile = None
+    if profile is None:
+        profile = random.choice(BROWSER_PROFILES)
     lang = random.choice(_LANG_VARIANTS)
 
     headers = {
@@ -119,9 +139,25 @@ def _pick_profile() -> dict:
     }
 
 
+def _resolve_runtime_supported_profile(preferred_impersonate: str | None) -> str | None:
+    if not preferred_impersonate:
+        return None
+    if preferred_impersonate in _SUPPORTED_IMPERSONATIONS:
+        return preferred_impersonate
+    if preferred_impersonate.startswith("chrome"):
+        for candidate in _CN_CHROME_PROFILE_FALLBACKS:
+            if candidate in _SUPPORTED_IMPERSONATIONS:
+                return candidate
+    return None
+
+
 async def _human_delay():
     """Sleep for a random duration to mimic human interaction pacing."""
     await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+
+
+def _encode_text_plain_json(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def _response_body_preview(response, limit: int = 240) -> str:
@@ -155,8 +191,8 @@ class HideMyEmail:
     base_url_v1 = "https://p68-maildomainws.icloud.com/v1/hme"
     base_url_v2 = "https://p68-maildomainws.icloud.com/v2/hme"
     params = {
-        "clientBuildNumber": "2536Project32",
-        "clientMasteringNumber": "2536B20",
+        "clientBuildNumber": "2612Build17",
+        "clientMasteringNumber": "2612Build17",
         "clientId": "",
         "dsid": "", # Directory Services Identifier (DSID) is a method of identifying AppleID accounts
     }
@@ -172,17 +208,56 @@ class HideMyEmail:
             cookies (str)   Cookie string to be used with requests. Required for authorization.
         """
         self.label = label.strip()
+        self.params = dict(type(self).params)
+        self.base_url_v1 = type(self).base_url_v1
+        self.base_url_v2 = type(self).base_url_v2
+        self.request_origin = "https://www.icloud.com"
+        self.request_referer = "https://www.icloud.com/"
+        self.lang_code = "en-us"
+        self.accept_language = None
+        self.preferred_profile = None
 
         # Cookie string to be used with requests. Required for authorization.
         self.cookies = cookies
 
+    def configure_service_context(self, service_url: str = "", home_endpoint: str = ""):
+        """Apply per-session service host and browser origin/referer context."""
+        if service_url:
+            base = service_url.rstrip("/")
+            for suffix in ("/v1/hme", "/v2/hme"):
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            self.base_url_v1 = f"{base}/v1/hme"
+            self.base_url_v2 = f"{base}/v2/hme"
+
+        if home_endpoint:
+            origin = home_endpoint.rstrip("/")
+            self.request_origin = origin
+            self.request_referer = f"{origin}/"
+            if origin.endswith(".com.cn"):
+                self.lang_code = "zh-tw"
+                self.accept_language = "zh-CN,zh;q=0.9,en;q=0.8"
+                self.preferred_profile = _resolve_runtime_supported_profile("chrome146")
+            else:
+                self.lang_code = "en-us"
+                self.accept_language = None
+                self.preferred_profile = None
+
+    def _build_session_headers(self, profile: dict) -> dict:
+        headers = dict(profile["headers"])
+        headers["Origin"] = self.request_origin
+        headers["Referer"] = self.request_referer
+        if self.accept_language:
+            headers["Accept-Language"] = self.accept_language
+        headers["Cookie"] = self.__cookies.strip()
+        return headers
+
     async def __aenter__(self):
         # Pick a random browser profile for this session
-        profile = _pick_profile()
+        profile = _pick_profile(self.preferred_profile)
         self._impersonate = profile["impersonate"]
-
-        headers = profile["headers"]
-        headers["Cookie"] = self.__cookies.strip()
+        headers = self._build_session_headers(profile)
 
         self.s = AsyncSession(
             headers=headers,
@@ -216,11 +291,9 @@ class HideMyEmail:
         """
         await self.s.close()
 
-        profile = _pick_profile()
+        profile = _pick_profile(self.preferred_profile)
         self._impersonate = profile["impersonate"]
-
-        headers = profile["headers"]
-        headers["Cookie"] = self.cookies.strip()
+        headers = self._build_session_headers(profile)
 
         self.s = AsyncSession(
             headers=headers,
@@ -235,7 +308,7 @@ class HideMyEmail:
             resp = await self.s.post(
                 f"{self.base_url_v1}/generate",
                 params=self.params,
-                json={"langCode": "en-us"},
+                data=_encode_text_plain_json({"langCode": self.lang_code}),
             )
             return _parse_json_response(resp, "generate_email")
         except asyncio.TimeoutError:
@@ -256,7 +329,7 @@ class HideMyEmail:
             resp = await self.s.post(
                 f"{self.base_url_v1}/reserve",
                 params=self.params,
-                json=payload,
+                data=_encode_text_plain_json(payload),
             )
             return _parse_json_response(resp, "reserve_email")
         except asyncio.TimeoutError:
