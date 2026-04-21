@@ -3,7 +3,12 @@ Web dashboard for multi-account HideMyEmail generation.
 Includes: Apple ID login + 2FA, per-account Start/Stop/Resume controls.
 """
 
+import logging
+
 from aiohttp import web
+
+
+logger = logging.getLogger(__name__)
 
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -627,71 +632,109 @@ poll();
 """
 
 
+
+
+async def _json_api(handler_name: str, action, *, error_key: str = "result", error_value=None):
+    try:
+        return await action()
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("API handler %s failed", handler_name)
+        if callable(error_value):
+            payload = error_value(exc)
+        elif error_value is not None:
+            payload = error_value
+        else:
+            payload = {error_key: f"Server error: {exc}"}
+        return web.json_response(payload, status=500)
+
 async def handle_index(request):
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
 
 async def handle_status(request):
-    manager = request.app["manager"]
-    return web.json_response(manager.to_dict())
+    async def _action():
+        manager = request.app["manager"]
+        return web.json_response(manager.to_dict())
+
+    return await _json_api("handle_status", _action, error_value=lambda exc: {"error": f"Server error: {exc}"})
 
 
 async def handle_add_account(request):
-    data = await request.json()
-    apple_id = data.get("apple_id", "").strip()
-    password = data.get("password", "")
-    domain = data.get("domain", "cn")
+    async def _action():
+        data = await request.json()
+        apple_id = data.get("apple_id", "").strip()
+        password = data.get("password", "")
+        domain = data.get("domain", "cn")
 
-    if not apple_id or not password:
-        return web.json_response({"result": "Apple ID and password required"})
+        if not apple_id or not password:
+            return web.json_response({"result": "Apple ID and password required"})
 
-    manager = request.app["manager"]
-    result = await manager.add_account(apple_id, password, domain)
-    return web.json_response({"result": result})
+        manager = request.app["manager"]
+        result = await manager.add_account(apple_id, password, domain)
+        return web.json_response({"result": result})
+
+    return await _json_api("handle_add_account", _action)
 
 
 async def handle_verify_2fa(request):
-    apple_id = request.match_info["account"]
-    data = await request.json()
-    code = data.get("code", "").strip()
+    async def _action():
+        apple_id = request.match_info["account"]
+        data = await request.json()
+        code = data.get("code", "").strip()
 
-    if not code:
-        return web.json_response({"result": "Code required"})
+        if not code:
+            return web.json_response({"result": "Code required"})
 
-    manager = request.app["manager"]
-    result = await manager.verify_2fa(apple_id, code)
-    return web.json_response({"result": result})
+        manager = request.app["manager"]
+        result = await manager.verify_2fa(apple_id, code)
+        return web.json_response({"result": result})
+
+    return await _json_api("handle_verify_2fa", _action)
 
 
 async def handle_remove(request):
-    apple_id = request.match_info["account"]
-    manager = request.app["manager"]
-    ok = await manager.remove_account(apple_id)
-    return web.json_response({"ok": ok})
+    async def _action():
+        apple_id = request.match_info["account"]
+        manager = request.app["manager"]
+        ok = await manager.remove_account(apple_id)
+        return web.json_response({"ok": ok})
+
+    return await _json_api("handle_remove", _action, error_value=lambda exc: {"ok": False, "error": f"Server error: {exc}"})
 
 
 async def handle_start(request):
-    apple_id = request.match_info["account"]
-    data = await request.json()
-    count = int(data.get("count", 5))
-    interval = int(data.get("interval", 45))
-    manager = request.app["manager"]
-    result = await manager.start_account(apple_id, count, interval)
-    return web.json_response({"result": result})
+    async def _action():
+        apple_id = request.match_info["account"]
+        data = await request.json()
+        count = int(data.get("count", 5))
+        interval = int(data.get("interval", 45))
+        manager = request.app["manager"]
+        result = await manager.start_account(apple_id, count, interval)
+        return web.json_response({"result": result})
+
+    return await _json_api("handle_start", _action)
 
 
 async def handle_stop(request):
-    apple_id = request.match_info["account"]
-    manager = request.app["manager"]
-    ok = await manager.stop_account(apple_id)
-    return web.json_response({"ok": ok})
+    async def _action():
+        apple_id = request.match_info["account"]
+        manager = request.app["manager"]
+        ok = await manager.stop_account(apple_id)
+        return web.json_response({"ok": ok})
+
+    return await _json_api("handle_stop", _action, error_value=lambda exc: {"ok": False, "error": f"Server error: {exc}"})
 
 
 async def handle_resume(request):
-    apple_id = request.match_info["account"]
-    manager = request.app["manager"]
-    result = await manager.resume_account(apple_id)
-    return web.json_response({"result": result})
+    async def _action():
+        apple_id = request.match_info["account"]
+        manager = request.app["manager"]
+        result = await manager.resume_account(apple_id)
+        return web.json_response({"result": result})
+
+    return await _json_api("handle_resume", _action)
 
 
 async def start_server(manager, port: int):
