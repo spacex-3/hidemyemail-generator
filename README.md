@@ -166,6 +166,14 @@ Existing generated email history can be reused directly, but saved login session
 - Session trust tokens (~90 days) are used to bypass repeated 2FA.
 - The `sessions/` directory and `emails-*.txt` files are excluded from git via `.gitignore`.
 
+## Troubleshooting Authentication
+
+The server automatically follows Apple's `domainToUse` response and selects the
+account's `pNNN-maildomainws` partition. If an older saved session reports that
+`X-APPLE-WEBAUTH-USER` or the DSID is missing, add the same account again in the
+dashboard and complete login/2FA once more. HTTP 401 and 403 responses now stop
+the generation task immediately; they are authentication errors, not rate limits.
+
 ## 📋 Requirements
 
 ```

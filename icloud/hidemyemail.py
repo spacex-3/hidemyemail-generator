@@ -1,68 +1,22 @@
 import asyncio
-import json
 import random
 
 from curl_cffi.requests import AsyncSession
-from curl_cffi.requests.impersonate import BrowserTypeLiteral
 
 
-# Browser fingerprint profiles — Safari-heavy since it's the most natural
-# client for iCloud. Each entry: (impersonate_target, matching_headers)
-BROWSER_PROFILES = [
-    {
-        "impersonate": "chrome146",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        "sec_ch_ua": "\"Google Chrome\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"",
-        "sec_ch_ua_mobile": "?0",
-        "sec_ch_ua_platform": "\"macOS\"",
-    },
-    {
-        "impersonate": "safari15_3",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.3 Safari/605.1.15",
-        "sec_ch_ua": None,  # Safari doesn't send sec-ch-ua
-        "sec_ch_ua_mobile": None,
-        "sec_ch_ua_platform": None,
-    },
-    {
-        "impersonate": "safari17_0",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        "sec_ch_ua": None,
-        "sec_ch_ua_mobile": None,
-        "sec_ch_ua_platform": None,
-    },
-    {
-        "impersonate": "safari18_0",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
-        "sec_ch_ua": None,
-        "sec_ch_ua_mobile": None,
-        "sec_ch_ua_platform": None,
-    },
-    {
-        "impersonate": "chrome124",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "sec_ch_ua_mobile": "?0",
-        "sec_ch_ua_platform": '"macOS"',
-    },
-    {
-        "impersonate": "chrome131",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
-        "sec_ch_ua_mobile": "?0",
-        "sec_ch_ua_platform": '"macOS"',
-    },
-]
-
-# Accept-Language variants to add diversity
-_LANG_VARIANTS = [
-    "en-US,en;q=0.9",
-    "en-US,en;q=0.8",
-    "en-GB,en-US;q=0.9,en;q=0.8",
-    "en-US,en-GB;q=0.9,en;q=0.7",
-    "en,en-US;q=0.9",
-    "en-US,en;q=0.9,zh-CN;q=0.8",
-    "en-US,en;q=0.9,ja;q=0.8",
-]
+_CURRENT_BROWSER_PROFILE = {
+    # "chrome" selects the newest Chrome TLS profile supported by the installed
+    # curl_cffi version without hard-failing on an unavailable numbered profile.
+    "impersonate": "chrome",
+    "user_agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/150.0.0.0 Safari/537.36"
+    ),
+    "sec_ch_ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Brave";v="150"',
+    "sec_ch_ua_mobile": "?0",
+    "sec_ch_ua_platform": '"macOS"',
+}
 
 # Random delay range (seconds) injected before each API call
 MIN_DELAY = 1.0
@@ -74,10 +28,6 @@ _RATE_LIMIT_KEYWORDS = [
     "rate limit",
     "try again later",
 ]
-
-_SUPPORTED_IMPERSONATIONS = set(BrowserTypeLiteral.__args__)
-_CN_CHROME_PROFILE_FALLBACKS = ("chrome146", "chrome124", "chrome131")
-
 
 def is_rate_limited(response: dict) -> bool:
     """Check if an API response indicates Apple's rate limiting."""
@@ -98,18 +48,40 @@ def is_rate_limited(response: dict) -> bool:
     return any(kw in reason_lower for kw in _RATE_LIMIT_KEYWORDS)
 
 
+def _error_reason(response: dict) -> str:
+    if not response:
+        return ""
+    error = response.get("error")
+    if isinstance(error, dict):
+        return str(error.get("errorMessage") or error.get("message") or "")
+    return str(response.get("reason") or error or "")
+
+
+def is_authentication_failed(response: dict) -> bool:
+    """Return whether waiting/retrying cannot repair the HME authorization."""
+    if not response or response.get("success"):
+        return False
+    if response.get("_http_status") in (401, 403):
+        return True
+
+    reason = _error_reason(response).lower()
+    markers = (
+        "x-apple-webauth-user",
+        "unauthorized",
+        "authentication required",
+        "not authorized",
+        "forbidden",
+    )
+    return any(marker in reason for marker in markers)
+
+
+class HMEAuthenticationError(RuntimeError):
+    """Raised when an HME request lacks a usable Apple web auth context."""
+
+
 def _pick_profile(preferred_impersonate: str | None = None) -> dict:
-    """Pick a browser profile and return assembled headers."""
-    if preferred_impersonate:
-        profile = next(
-            (candidate for candidate in BROWSER_PROFILES if candidate["impersonate"] == preferred_impersonate),
-            None,
-        )
-    else:
-        profile = None
-    if profile is None:
-        profile = random.choice(BROWSER_PROFILES)
-    lang = random.choice(_LANG_VARIANTS)
+    """Return the deterministic request profile captured from current iCloud."""
+    profile = _CURRENT_BROWSER_PROFILE
 
     headers = {
         "Connection": "keep-alive",
@@ -123,41 +95,23 @@ def _pick_profile(preferred_impersonate: str | None = None) -> dict:
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Dest": "empty",
         "Referer": "https://www.icloud.com/",
-        "Accept-Language": lang,
+        "Accept-Language": "en-US,en;q=0.7",
     }
 
-    # Chrome-family browsers send sec-ch-ua headers; Safari does not
-    if profile["sec_ch_ua"] is not None:
-        headers["sec-ch-ua"] = profile["sec_ch_ua"]
-        headers["sec-ch-ua-mobile"] = profile["sec_ch_ua_mobile"]
-        headers["sec-ch-ua-platform"] = profile["sec_ch_ua_platform"]
-        headers["Sec-GPC"] = "1"
+    headers["sec-ch-ua"] = profile["sec_ch_ua"]
+    headers["sec-ch-ua-mobile"] = profile["sec_ch_ua_mobile"]
+    headers["sec-ch-ua-platform"] = profile["sec_ch_ua_platform"]
+    headers["Sec-GPC"] = "1"
 
     return {
-        "impersonate": profile["impersonate"],
+        "impersonate": preferred_impersonate or profile["impersonate"],
         "headers": headers,
     }
-
-
-def _resolve_runtime_supported_profile(preferred_impersonate: str | None) -> str | None:
-    if not preferred_impersonate:
-        return None
-    if preferred_impersonate in _SUPPORTED_IMPERSONATIONS:
-        return preferred_impersonate
-    if preferred_impersonate.startswith("chrome"):
-        for candidate in _CN_CHROME_PROFILE_FALLBACKS:
-            if candidate in _SUPPORTED_IMPERSONATIONS:
-                return candidate
-    return None
 
 
 async def _human_delay():
     """Sleep for a random duration to mimic human interaction pacing."""
     await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
-
-
-def _encode_text_plain_json(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def _response_body_preview(response, limit: int = 240) -> str:
@@ -171,18 +125,25 @@ def _response_body_preview(response, limit: int = 240) -> str:
 
 
 def _parse_json_response(response, action: str) -> dict:
+    status = getattr(response, "status_code", None)
     try:
-        return response.json()
+        data = response.json()
+        if isinstance(data, dict):
+            data = dict(data)
+            data.setdefault("_http_status", status)
+            return data
+        raise ValueError("JSON response was not an object")
     except Exception:
         headers = getattr(response, "headers", {}) or {}
         content_type = headers.get("content-type") or headers.get("Content-Type") or "unknown"
-        status = getattr(response, "status_code", "unknown")
+        rendered_status = status if status is not None else "unknown"
         preview = _response_body_preview(response)
         return {
             "error": 1,
+            "_http_status": status,
             "reason": (
                 f"Non-JSON response during {action} "
-                f"(status={status}, content-type={content_type}, body={preview})"
+                f"(status={rendered_status}, content-type={content_type}, body={preview})"
             ),
         }
 
@@ -191,8 +152,8 @@ class HideMyEmail:
     base_url_v1 = "https://p68-maildomainws.icloud.com/v1/hme"
     base_url_v2 = "https://p68-maildomainws.icloud.com/v2/hme"
     params = {
-        "clientBuildNumber": "2612Build17",
-        "clientMasteringNumber": "2612Build17",
+        "clientBuildNumber": "2626Build17",
+        "clientMasteringNumber": "2626Build17",
         "clientId": "",
         "dsid": "", # Directory Services Identifier (DSID) is a method of identifying AppleID accounts
     }
@@ -236,13 +197,13 @@ class HideMyEmail:
             self.request_origin = origin
             self.request_referer = f"{origin}/"
             if origin.endswith(".com.cn"):
-                self.lang_code = "zh-tw"
+                self.lang_code = "zh-cn"
                 self.accept_language = "zh-CN,zh;q=0.9,en;q=0.8"
-                self.preferred_profile = _resolve_runtime_supported_profile("chrome146")
+                self.preferred_profile = "chrome"
             else:
                 self.lang_code = "en-us"
-                self.accept_language = None
-                self.preferred_profile = None
+                self.accept_language = "en-US,en;q=0.7"
+                self.preferred_profile = "chrome"
 
     def _build_session_headers(self, profile: dict) -> dict:
         headers = dict(profile["headers"])
@@ -308,7 +269,7 @@ class HideMyEmail:
             resp = await self.s.post(
                 f"{self.base_url_v1}/generate",
                 params=self.params,
-                data=_encode_text_plain_json({"langCode": self.lang_code}),
+                json={"langCode": self.lang_code},
             )
             return _parse_json_response(resp, "generate_email")
         except asyncio.TimeoutError:
@@ -329,7 +290,7 @@ class HideMyEmail:
             resp = await self.s.post(
                 f"{self.base_url_v1}/reserve",
                 params=self.params,
-                data=_encode_text_plain_json(payload),
+                json=payload,
             )
             return _parse_json_response(resp, "reserve_email")
         except asyncio.TimeoutError:

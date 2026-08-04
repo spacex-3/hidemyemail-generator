@@ -117,17 +117,12 @@ class ICloudSession:
 
     def __init__(self, apple_id: str, domain: str = "cn"):
         self.apple_id = apple_id
-        self.domain = domain
         self.client_id = f"auth-{str(uuid1()).lower()}"
         self.session_data: dict = {}
         self.data: dict = {}
         self._password: str | None = None
 
-        ep = ENDPOINTS.get(domain, ENDPOINTS["cn"])
-        self.AUTH_ROOT = ep["AUTH_ROOT"]
-        self.AUTH_ENDPOINT = ep["AUTH"]
-        self.HOME_ENDPOINT = ep["HOME"]
-        self.SETUP_ENDPOINT = ep["SETUP"]
+        self._configure_domain(domain)
 
         # requests session for auth (synchronous)
         self.session = requests.Session()
@@ -151,6 +146,45 @@ class ICloudSession:
         self.session.cookies = cookielib.LWPCookieJar(filename=self._cookiejar_path)
 
         self._load_session()
+
+    def _configure_domain(self, domain: str) -> None:
+        """Apply one region consistently to every Apple endpoint and header."""
+        resolved_domain = domain if domain in ENDPOINTS else "cn"
+        self.domain = resolved_domain
+        ep = ENDPOINTS[resolved_domain]
+        self.AUTH_ROOT = ep["AUTH_ROOT"]
+        self.AUTH_ENDPOINT = ep["AUTH"]
+        self.HOME_ENDPOINT = ep["HOME"]
+        self.SETUP_ENDPOINT = ep["SETUP"]
+
+        if hasattr(self, "session"):
+            self.session.headers.update({
+                "Origin": self.HOME_ENDPOINT,
+                "Referer": f"{self.HOME_ENDPOINT}/",
+            })
+
+    def _apply_domain_to_use(self, domain_to_use: str) -> bool:
+        """Switch to the iCloud region selected by Apple's setup service."""
+        normalized = str(domain_to_use or "").strip().lower().rstrip(".")
+        if normalized.endswith("icloud.com.cn"):
+            resolved_domain = "cn"
+        elif normalized.endswith("icloud.com"):
+            resolved_domain = "com"
+        else:
+            return False
+
+        if resolved_domain == self.domain:
+            return False
+
+        logger.info(
+            "Apple selected %s; switching session from %s to %s",
+            domain_to_use,
+            self.domain,
+            resolved_domain,
+        )
+        self._configure_domain(resolved_domain)
+        self.session_data["domain"] = resolved_domain
+        return True
 
     # ── persistence ──────────────────────────────────────────
 
@@ -426,27 +460,28 @@ class ICloudSession:
             "extended_login": True,
             "trustToken": self.session_data.get("trust_token", ""),
         }
-        resp = self.session.post(
-            f"{self.SETUP_ENDPOINT}/accountLogin",
-            json=data,
-            headers={
-                "Origin": self.HOME_ENDPOINT,
-                "Referer": f"{self.HOME_ENDPOINT}/",
-            },
-        )
-        self._capture_headers(resp)
-        self.data = resp.json()
 
-        # Handle domain redirect
-        domain_to_use = self.data.get("domainToUse")
-        if domain_to_use:
-            logger.warning(f"Apple insists on domain: {domain_to_use}")
+        for _ in range(2):
+            resp = self.session.post(
+                f"{self.SETUP_ENDPOINT}/accountLogin",
+                json=data,
+                headers={
+                    "Origin": self.HOME_ENDPOINT,
+                    "Referer": f"{self.HOME_ENDPOINT}/",
+                },
+            )
+            self._capture_headers(resp)
+            resp.raise_for_status()
+            self.data = resp.json()
+
+            if not self._apply_domain_to_use(self.data.get("domainToUse", "")):
+                break
 
         self._save_session()
 
     # ── session validation & auto re-auth ────────────────────
 
-    def validate_token(self) -> bool:
+    def validate_token(self, follow_domain_redirect: bool = True) -> bool:
         """Check if the current session is still valid."""
         try:
             resp = self.session.post(
@@ -459,8 +494,17 @@ class ICloudSession:
             )
             if resp.status_code == 200:
                 self.data = resp.json()
+                if (
+                    follow_domain_redirect
+                    and self._apply_domain_to_use(self.data.get("domainToUse", ""))
+                ):
+                    if not self.session_data.get("session_token"):
+                        return False
+                    self._authenticate_with_token()
+                    return self.validate_token(follow_domain_redirect=False)
                 return True
         except Exception:
+            logger.exception("Apple session validation failed")
             pass
         return False
 
@@ -492,11 +536,10 @@ class ICloudSession:
     # ── cookie export ────────────────────────────────────────
 
     def get_cookie_string(self) -> str:
-        """Export cookies as a header string for curl_cffi."""
-        parts = []
-        for cookie in self.session.cookies:
-            parts.append(f"{cookie.name}={cookie.value}")
-        return "; ".join(parts)
+        """Export only cookies that a browser would send to the HME host."""
+        target_url = self.get_maildomain_service_url() or self.HOME_ENDPOINT
+        request = requests.Request("GET", target_url).prepare()
+        return requests.cookies.get_cookie_header(self.session.cookies, request) or ""
 
     def get_dsid(self) -> str:
         """Get DSID from auth data."""
@@ -504,15 +547,12 @@ class ICloudSession:
         if dsid:
             return dsid
 
-        cookie_jar = self.session.cookies
-        if hasattr(cookie_jar, "get"):
-            cookie_value = cookie_jar.get("X-APPLE-WEBAUTH-USER", "")
-        else:
-            cookie_value = ""
-            for cookie in cookie_jar:
-                if getattr(cookie, "name", "") == "X-APPLE-WEBAUTH-USER":
-                    cookie_value = cookie.value
-                    break
+        cookie_value = ""
+        for item in self.get_cookie_string().split(";"):
+            name, separator, value = item.strip().partition("=")
+            if separator and name == "X-APPLE-WEBAUTH-USER":
+                cookie_value = value
+                break
 
         if cookie_value:
             for part in str(cookie_value).strip('"').split(":"):
@@ -524,8 +564,41 @@ class ICloudSession:
     def get_maildomain_service_url(self) -> str:
         """Return the current maildomain service URL from Apple bootstrap data."""
         webservices = self.data.get("webservices", {}) or {}
+        service = webservices.get("maildomainws", {}) or {}
+        service_url = str(service.get("url", "")).rstrip("/")
+        if service_url:
+            return service_url
+
+        user_partition = self.data.get("userPartition")
+        try:
+            partition = int(user_partition)
+        except (TypeError, ValueError):
+            partition = 0
+        if partition > 0:
+            suffix = "icloud.com.cn" if self.domain == "cn" else "icloud.com"
+            return f"https://p{partition}-maildomainws.{suffix}"
+
         service = webservices.get("premiummailsettings", {}) or {}
         return str(service.get("url", "")).rstrip("/")
+
+    def validate_hme_context(self) -> tuple[bool, str]:
+        """Verify that the authenticated session can authorize HME requests."""
+        cookie_string = self.get_cookie_string()
+        cookie_names = {
+            item.partition("=")[0].strip()
+            for item in cookie_string.split(";")
+            if "=" in item
+        }
+        if "X-APPLE-WEBAUTH-USER" not in cookie_names:
+            return (
+                False,
+                "Apple login completed but the HME authorization cookie "
+                "X-APPLE-WEBAUTH-USER is missing. Re-authenticate after the "
+                "account region is resolved.",
+            )
+        if not self.get_dsid():
+            return False, "Apple login completed but the HME session DSID is missing."
+        return True, ""
 
     # ── cleanup ──────────────────────────────────────────────
 

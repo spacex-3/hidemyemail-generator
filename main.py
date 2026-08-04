@@ -11,7 +11,12 @@ import re
 from rich.console import Console
 from rich.table import Table
 
-from icloud import HideMyEmail, is_rate_limited
+from icloud import (
+    HMEAuthenticationError,
+    HideMyEmail,
+    is_authentication_failed,
+    is_rate_limited,
+)
 from icloud.auth import ICloudSession, load_saved_sessions
 from storage_paths import get_emails_file
 
@@ -78,6 +83,19 @@ def apply_hme_session_context(hme: HideMyEmail, session: ICloudSession) -> None:
         service_url=session.get_maildomain_service_url(),
         home_endpoint=session.HOME_ENDPOINT,
     )
+
+
+def _hme_error_message(response: dict) -> str:
+    error = response.get("error") if response else None
+    if isinstance(error, dict):
+        message = error.get("errorMessage") or error.get("message")
+    else:
+        message = response.get("reason") if response else None
+    message = str(message or error or "Unknown HME error")
+    status = response.get("_http_status") if response else None
+    if status:
+        return f"HTTP {status}: {message}"
+    return message
 
 
 # ══════════════════════════════════════════════════════════════
@@ -181,6 +199,14 @@ class RichHideMyEmail(HideMyEmail):
             self.progress.errors += 1
             return
 
+        if is_authentication_failed(gen_res):
+            self.progress.errors += 1
+            message = _hme_error_message(gen_res)
+            console.log(
+                f"{self._tag} [bold red][AUTH][/] Generate rejected: {message}"
+            )
+            raise HMEAuthenticationError(message)
+
         if is_rate_limited(gen_res):
             self._rate_limited = True
             console.log(f"{self._tag} [bold yellow][RATE LIMIT][/] Generate blocked")
@@ -209,6 +235,14 @@ class RichHideMyEmail(HideMyEmail):
         if not reserve_res:
             self.progress.errors += 1
             return
+
+        if is_authentication_failed(reserve_res):
+            self.progress.errors += 1
+            message = _hme_error_message(reserve_res)
+            console.log(
+                f'{self._tag} [bold red][AUTH][/] "{email}" - Reserve rejected: {message}'
+            )
+            raise HMEAuthenticationError(message)
 
         if is_rate_limited(reserve_res):
             self._rate_limited = True
@@ -369,6 +403,8 @@ class RichHideMyEmail(HideMyEmail):
                         self._generate_batch(batch_size), 
                         timeout=60.0
                     )
+                except HMEAuthenticationError:
+                    raise
                 except asyncio.TimeoutError:
                     console.log(
                         f"{self._tag} [bold red]⚠ Generation timed out (Apple blocked IP). Treating as Rate Limit.[/]"
@@ -378,6 +414,11 @@ class RichHideMyEmail(HideMyEmail):
                 except Exception as e:
                     console.log(f"{self._tag} [bold red]⚠ Generation error: {e}[/]")
                     batch = []
+
+                if not batch and not self._rate_limited:
+                    raise RuntimeError(
+                        "Generation batch produced no successful emails; see the preceding HME error"
+                    )
 
                 if batch:
                     self._save_emails(batch)
@@ -461,6 +502,12 @@ class RichHideMyEmail(HideMyEmail):
         except asyncio.CancelledError:
             self.progress.status = "stopped"
             self.progress.message = "Task cancelled"
+        except HMEAuthenticationError as e:
+            self.progress.status = "error"
+            self.progress.message = f"Authentication failed: {e}"
+            console.log(
+                f"{self._tag} [bold red]Authentication failed; generation stopped: {e}[/]"
+            )
         except Exception as e:
             _record_runtime_trace("RichHideMyEmail.generate", e)
             self.progress.status = "error"
@@ -606,6 +653,12 @@ class GenerationManager:
             progress.message = f"Auth: {auth_result}"
             return auth_result
 
+        context_ok, context_error = session.validate_hme_context()
+        if not context_ok:
+            progress.status = "error"
+            progress.message = f"Auth: {context_error}"
+            return context_error
+
         await self._cancel_task(apple_id)
 
         progress.reset(count)
@@ -653,6 +706,12 @@ class GenerationManager:
             progress.message = f"Auth: {auth_result}"
             return auth_result
 
+        context_ok, context_error = session.validate_hme_context()
+        if not context_ok:
+            progress.status = "error"
+            progress.message = f"Auth: {context_error}"
+            return context_error
+
         await self._cancel_task(apple_id)
 
         stop_event = asyncio.Event()
@@ -687,7 +746,15 @@ class GenerationManager:
     async def _run(self, apple_id, session, count, progress, stop_event):
         """Run generation for a single account in a fresh session."""
         try:
-            session.validate_token()
+            if not session.validate_token():
+                progress.status = "error"
+                progress.message = "Auth: Apple session validation failed"
+                return
+            context_ok, context_error = session.validate_hme_context()
+            if not context_ok:
+                progress.status = "error"
+                progress.message = f"Auth: {context_error}"
+                return
             cookie_str = session.get_cookie_string()
             if not cookie_str:
                 progress.status = "error"
