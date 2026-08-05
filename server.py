@@ -556,8 +556,9 @@ async function spA(i){
 }
 async function rsA(i){
     try {
-        const a=S.accounts[i];
-        const r=await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/resume',{method:'POST'});
+        const a=S.accounts[i], itv=parseInt(gid('itv'+i).value)||45;
+        const r=await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/resume',
+            {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval:itv})});
         const d=await r.json();
         if(d.result && d.result!=='ok') alert(d.result);
         poll();
@@ -738,8 +739,16 @@ async def handle_stop(request):
 async def handle_resume(request):
     async def _action():
         apple_id = request.match_info["account"]
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        try:
+            interval = int(data["interval"]) if data.get("interval") is not None else None
+        except (TypeError, ValueError):
+            interval = None
         manager = request.app["manager"]
-        result = await manager.resume_account(apple_id)
+        result = await manager.resume_account(apple_id, interval)
         return web.json_response({"result": result})
 
     return await _json_api("handle_resume", _action)

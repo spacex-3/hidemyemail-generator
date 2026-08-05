@@ -679,7 +679,7 @@ class GenerationManager:
             self._stop_events[apple_id].set()
         return True
 
-    async def resume_account(self, apple_id: str):
+    async def resume_account(self, apple_id: str, interval: int | None = None):
         """Resume a stopped account from where it left off."""
         if apple_id not in self.accounts:
             return "Account not found"
@@ -713,6 +713,9 @@ class GenerationManager:
             return context_error
 
         await self._cancel_task(apple_id)
+
+        if interval is not None:
+            progress.interval = max(30, int(interval))
 
         stop_event = asyncio.Event()
         self._stop_events[apple_id] = stop_event
