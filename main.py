@@ -151,10 +151,10 @@ class Progress:
             "interval": self.interval,
         }
 
-    def reset(self, target: int):
+    def reset(self, target: int, completed: int = 0):
         """Reset for a fresh generation run."""
         self.target = target
-        self.completed = 0
+        self.completed = completed
         self.errors = 0
         self.success_in_cycle = 0
         self.started_at = 0
@@ -343,13 +343,15 @@ class RichHideMyEmail(HideMyEmail):
         try:
             if self.progress.started_at == 0:
                 self.progress.started_at = time.time()
+            cycle_size = max(1, int(self.progress.cycle_size))
+            self.progress.cycle_size = cycle_size
             self.progress.fingerprint = self.browser_fingerprint
             self.progress.status = "generating"
 
             console.log(
                 f"{self._tag} Starting: {count} emails | "
                 f"FP: {self.browser_fingerprint} | "
-                f"Batch: {BATCH_SIZE} | Cycle: {CYCLE_SIZE}"
+                f"Batch: {BATCH_SIZE} | Cycle: {cycle_size}"
             )
 
             remaining = count
@@ -369,7 +371,7 @@ class RichHideMyEmail(HideMyEmail):
                     console.log(f"{self._tag} [yellow]Stopped by user[/]")
                     return
 
-                cycle_room = max(1, CYCLE_SIZE - success_in_cycle)
+                cycle_room = max(1, cycle_size - success_in_cycle)
                 batch_size = min(BATCH_SIZE, remaining, cycle_room)
                 batch_num += 1
 
@@ -434,7 +436,7 @@ class RichHideMyEmail(HideMyEmail):
                     console.log(
                         f"{self._tag} [dim]💾 Saved {len(batch)}. "
                         f"Total: {self.progress.completed}/{self.progress.target} | "
-                        f"Cycle: {success_in_cycle}/{CYCLE_SIZE}[/]"
+                        f"Cycle: {success_in_cycle}/{cycle_size}[/]"
                     )
 
                 # ── rate limited ──
@@ -475,7 +477,7 @@ class RichHideMyEmail(HideMyEmail):
                             batch_num = 0
 
                 # ── proactive cycle cooldown ──
-                elif success_in_cycle >= CYCLE_SIZE and remaining > 0:
+                elif success_in_cycle >= cycle_size and remaining > 0:
                     console.log(
                         f"{self._tag} [bold cyan]🔄 Cycle done "
                         f"({success_in_cycle} emails). Rotating...[/]"
@@ -630,7 +632,13 @@ class GenerationManager:
 
     # ── generation control ───────────────────────────────────
 
-    async def start_account(self, apple_id: str, count: int, interval: int = 45):
+    async def start_account(
+        self,
+        apple_id: str,
+        count: int,
+        interval: int = 45,
+        cycle_size: int = CYCLE_SIZE,
+    ):
         """Start fresh generation (resets progress)."""
         if apple_id not in self.accounts:
             return "Account not found"
@@ -661,14 +669,26 @@ class GenerationManager:
 
         await self._cancel_task(apple_id)
 
-        progress.reset(count)
+        existing = len(progress.emails)
+        progress.reset(count, completed=existing)
         progress.interval = interval
+        progress.cycle_size = max(1, int(cycle_size))
+        remaining = max(0, count - existing)
+
+        if remaining == 0:
+            self._tasks.pop(apple_id, None)
+            self._stop_events.pop(apple_id, None)
+            progress.status = "done"
+            progress.message = (
+                f"Target already reached ({existing}/{count})."
+            )
+            return "ok"
 
         stop_event = asyncio.Event()
         self._stop_events[apple_id] = stop_event
 
         task = asyncio.create_task(
-            self._run(apple_id, session, count, progress, stop_event)
+            self._run(apple_id, session, remaining, progress, stop_event)
         )
         self._tasks[apple_id] = task
         return "ok"
@@ -679,7 +699,12 @@ class GenerationManager:
             self._stop_events[apple_id].set()
         return True
 
-    async def resume_account(self, apple_id: str, interval: int | None = None):
+    async def resume_account(
+        self,
+        apple_id: str,
+        interval: int | None = None,
+        cycle_size: int | None = None,
+    ):
         """Resume a stopped account from where it left off."""
         if apple_id not in self.accounts:
             return "Account not found"
@@ -716,6 +741,8 @@ class GenerationManager:
 
         if interval is not None:
             progress.interval = max(30, int(interval))
+        if cycle_size is not None:
+            progress.cycle_size = max(1, int(cycle_size))
 
         stop_event = asyncio.Event()
         self._stop_events[apple_id] = stop_event

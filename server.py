@@ -62,7 +62,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         .acct-r1{display:flex;align-items:center;gap:.5rem;margin-bottom:.55rem;flex-wrap:wrap}
         .acct-name{font-size:.82rem;font-weight:600;overflow:hidden;text-overflow:ellipsis;
             white-space:nowrap;max-width:220px}
-        .acct-ctrl{display:flex;gap:.25rem;align-items:center;margin-left:auto}
+        .acct-ctrl{display:flex;gap:.25rem;align-items:center;margin-left:auto;flex-wrap:wrap;justify-content:flex-end}
         .cnt-input{width:56px;background:rgba(255,255,255,.05);border:1px solid var(--border);
             border-radius:5px;color:var(--t1);font-family:'JetBrains Mono',monospace;
             font-size:.75rem;padding:.22rem .35rem;text-align:center;outline:none;
@@ -289,13 +289,15 @@ function mk(a,i){
             <span class="acct-name" style="color:${c}">📧 ${a.account}</span>
             <div class="acct-ctrl" id="ctrl${i}">
                 <label style="font-size:0.65rem;color:var(--t2)">目标</label>
-                <input type="number" class="cnt-input" id="ci${i}" value="5" min="1" max="9999" style="width:48px;" title="生成数量">
+                <input type="number" class="cnt-input" id="ci${i}" value="${a.target>0?a.target:5}" min="1" max="9999" style="width:48px;" title="邮箱总目标">
                 <label style="font-size:0.65rem;color:var(--t2);margin-left:3px">间隔(min)</label>
-                <input type="number" class="cnt-input" id="itv${i}" value="45" min="1" max="999" style="width:42px;" title="轮次间隔">
+                <input type="number" class="cnt-input" id="itv${i}" value="${a.interval||45}" min="1" max="999" style="width:42px;" title="轮次间隔">
+                <label style="font-size:0.65rem;color:var(--t2);margin-left:3px">每轮</label>
+                <input type="number" class="cnt-input" id="cyi${i}" value="${a.cycle_size||5}" min="1" max="999" style="width:42px;" title="每轮生成数量">
                 <button class="cb start" id="go${i}" onclick="goA(${i})">▶ Start</button>
                 <button class="cb stop" id="sp${i}" onclick="spA(${i})" style="display:none">⏹ Stop</button>
                 <button class="cb resume" id="rs${i}" onclick="rsA(${i})" style="display:none" title="Resume: 继续由于 Stop 暂停的进度">▶ Resume</button>
-                <button class="cb start mini" id="rt${i}" onclick="goA(${i})" style="display:none" title="Restart: 进度清零，并按照输入框新值重新开始此账号任务">↺ Restart</button>
+                <button class="cb start mini" id="rt${i}" onclick="goA(${i})" style="display:none" title="Restart: 按照当前总目标、间隔和每轮数量重新开始">↺ Restart</button>
             </div>
             <span class="badge"><span class="dot" id="d${i}"></span> <span id="s${i}">Idle</span></span>
             <span class="acct-fp" id="f${i}">—</span>
@@ -367,13 +369,16 @@ function up(a,i){
     sh('go'+i, idle); sh('sp'+i, run); sh('rs'+i, canResume); sh('rt'+i, stopped);
     const ci=gid('ci'+i); if(ci){ci.disabled=run||needsAuth; if(needsAuth)ci.style.display='none'; else ci.style.display='';}
     const itv=gid('itv'+i); if(itv){itv.disabled=run||needsAuth; if(needsAuth)itv.style.display='none'; else itv.style.display='';}
+    const cyi=gid('cyi'+i); if(cyi){cyi.disabled=run||needsAuth; if(needsAuth)cyi.style.display='none'; else cyi.style.display='';}
     if(run && a.target>0 && ci) ci.value=a.target;
     if(run && a.interval && itv) itv.value=a.interval;
+    if(run && a.cycle_size && cyi) cyi.value=a.cycle_size;
 
     // Disable start if not authenticated
     const goBtn=gid('go'+i); if(goBtn) goBtn.disabled=needsAuth;
     const l1=ci?.previousElementSibling; if(l1) l1.style.display=needsAuth?'none':'';
     const l2=itv?.previousElementSibling; if(l2) l2.style.display=needsAuth?'none':'';
+    const l3=cyi?.previousElementSibling; if(l3) l3.style.display=needsAuth?'none':'';
 
     // Show bars/footer only after started
     const started=a.target>0 && isAuth;
@@ -389,11 +394,11 @@ function up(a,i){
     sh('del'+i, isAuth && !run);
 
     // Progress
-    const p=a.target>0?(a.completed/a.target*100):0;
+    const p=a.target>0?Math.min(100,a.completed/a.target*100):0;
     sw('b'+i,p); st('n'+i, started?a.completed+'/'+a.target:'—');
 
     // Cycle
-    const cp=a.cycle_size>0?(a.success_in_cycle/a.cycle_size*100):0;
+    const cp=a.cycle_size>0?Math.min(100,a.success_in_cycle/a.cycle_size*100):0;
     sw('c'+i,cp); st('cn'+i, a.success_in_cycle+'/'+a.cycle_size);
 
     // Cooldown
@@ -534,10 +539,10 @@ async function removeA(i){
 // ── Generation API ──
 async function goA(i){
     try {
-        const a=S.accounts[i], c=parseInt(gid('ci'+i).value), itv=parseInt(gid('itv'+i).value)||45;
+        const a=S.accounts[i], c=parseInt(gid('ci'+i).value), itv=parseInt(gid('itv'+i).value)||45, cyc=parseInt(gid('cyi'+i).value)||5;
         if(!c||c<1){gid('ci'+i).focus();return;}
         const r=await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/start',
-            {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:c,interval:itv})});
+            {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:c,interval:itv,cycle_size:cyc})});
         const d=await r.json();
         if(d.result && d.result!=='ok') alert(d.result);
         poll();
@@ -556,9 +561,9 @@ async function spA(i){
 }
 async function rsA(i){
     try {
-        const a=S.accounts[i], itv=parseInt(gid('itv'+i).value)||45;
+        const a=S.accounts[i], itv=parseInt(gid('itv'+i).value)||45, cyc=parseInt(gid('cyi'+i).value)||5;
         const r=await fetch('/api/accounts/'+encodeURIComponent(a.account)+'/resume',
-            {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval:itv})});
+            {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval:itv,cycle_size:cyc})});
         const d=await r.json();
         if(d.result && d.result!=='ok') alert(d.result);
         poll();
@@ -719,8 +724,14 @@ async def handle_start(request):
         data = await request.json()
         count = int(data.get("count", 5))
         interval = int(data.get("interval", 45))
+        try:
+            cycle_size = int(data.get("cycle_size", 5))
+        except (TypeError, ValueError):
+            cycle_size = 5
         manager = request.app["manager"]
-        result = await manager.start_account(apple_id, count, interval)
+        result = await manager.start_account(
+            apple_id, count, interval, cycle_size
+        )
         return web.json_response({"result": result})
 
     return await _json_api("handle_start", _action)
@@ -747,8 +758,18 @@ async def handle_resume(request):
             interval = int(data["interval"]) if data.get("interval") is not None else None
         except (TypeError, ValueError):
             interval = None
+        try:
+            cycle_size = (
+                int(data["cycle_size"])
+                if data.get("cycle_size") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            cycle_size = None
         manager = request.app["manager"]
-        result = await manager.resume_account(apple_id, interval)
+        result = await manager.resume_account(
+            apple_id, interval, cycle_size
+        )
         return web.json_response({"result": result})
 
     return await _json_api("handle_resume", _action)

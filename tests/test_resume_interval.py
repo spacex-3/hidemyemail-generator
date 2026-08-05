@@ -19,19 +19,23 @@ class FakeResumeManager:
     def __init__(self):
         self.call = None
 
-    async def resume_account(self, account, interval=None):
-        self.call = (account, interval)
+    async def resume_account(self, account, interval=None, cycle_size=None):
+        self.call = (account, interval, cycle_size)
         return "ok"
 
 
 class FakeRequest:
-    def __init__(self, manager, interval):
+    def __init__(self, manager, interval, cycle_size=15):
         self.match_info = {"account": "person@example.com"}
         self.app = {"manager": manager}
         self._interval = interval
+        self._cycle_size = cycle_size
 
     async def json(self):
-        return {"interval": self._interval}
+        return {
+            "interval": self._interval,
+            "cycle_size": self._cycle_size,
+        }
 
 
 class ResumeIntervalTests(unittest.TestCase):
@@ -84,14 +88,18 @@ class ResumeIntervalTests(unittest.TestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(json.loads(response.text), {"result": "ok"})
-        self.assertEqual(manager.call, ("person@example.com", 66))
+        self.assertEqual(manager.call, ("person@example.com", 66, 15))
 
     def test_resume_browser_request_sends_current_interval(self):
         resume_function = DASHBOARD_HTML.split("async function rsA(i){", 1)[1]
         resume_function = resume_function.split("function cpA(i){", 1)[0]
 
         self.assertIn("gid('itv'+i).value", resume_function)
-        self.assertIn("JSON.stringify({interval:itv})", resume_function)
+        self.assertIn("gid('cyi'+i).value", resume_function)
+        self.assertIn(
+            "JSON.stringify({interval:itv,cycle_size:cyc})",
+            resume_function,
+        )
 
 
 if __name__ == "__main__":
