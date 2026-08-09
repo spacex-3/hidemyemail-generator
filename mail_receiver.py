@@ -88,6 +88,28 @@ def extract_openai_code(text: str) -> str:
     return ""
 
 
+def _imap_response_text(value) -> str:
+    if isinstance(value, bytes):
+        for encoding in ("utf-8", "gb18030", "gbk", "latin1"):
+            try:
+                return value.decode(encoding)
+            except UnicodeDecodeError:
+                pass
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, (list, tuple)):
+        return " ".join(_imap_response_text(item) for item in value)
+    return str(value or "")
+
+
+def _quote_imap_mailbox(name: str) -> str:
+    """Quote simple mailbox names consistently with provider IMAP parsers."""
+    value = str(name or "INBOX")
+    if value.startswith('"') and value.endswith('"'):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
     """IMAP4_SSL with a per-profile SOCKS5 or HTTP CONNECT route."""
 
@@ -178,14 +200,35 @@ class MailboxReceiver:
             profile["proxy_url"] if profile["network_mode"] != "direct" else "",
         )
         client.login(profile["imap_username"], profile["imap_password"])
-        status, _ = client.select(profile["folder"], readonly=True)
+        id_probe = self._send_provider_id(client, profile)
+        status, data = client.select(
+            _quote_imap_mailbox(profile["folder"]), readonly=True
+        )
         if status != "OK":
             try:
                 client.logout()
             except Exception:
                 pass
-            raise RuntimeError(f"Cannot select IMAP folder {profile['folder']}")
+            detail = _imap_response_text(data)[:500]
+            id_detail = _imap_response_text(id_probe[1])[:300] if id_probe else ""
+            raise RuntimeError(
+                f"Cannot select IMAP folder {profile['folder']}: {status} {detail}"
+                + (f"; IMAP ID response: {id_detail}" if id_detail else "")
+            )
         return client
+
+    @staticmethod
+    def _send_provider_id(client, profile: dict):
+        """NetEase IMAP often rejects SELECT until a client ID is presented."""
+        host = str(profile.get("imap_host") or "").lower()
+        if host not in {"imap.163.com", "imap.126.com"}:
+            return None
+        try:
+            imaplib.Commands["ID"] = ("AUTH",)
+            payload = '("name" "HME Mailbox" "version" "1.0" "vendor" "HME")'
+            return client._simple_command("ID", payload)
+        except Exception as exc:
+            return "ERR", [str(exc)]
 
     @staticmethod
     def _all_uids(client) -> list[int]:

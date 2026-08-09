@@ -163,6 +163,46 @@ class OpenAIReceiverTests(unittest.TestCase):
         self.assertEqual(result["messages"][1]["matched_aliases"], ["sold@icloud.com"])
         self.assertEqual(self.store.latest_openai_code("sold@icloud.com")["code"], "246810")
 
+    def test_netease_profiles_send_imap_id_and_keep_select_error_details(self):
+        netease = self.store.create_profile(
+            preset="163",
+            label="",
+            email="receiver@163.com",
+            imap_host="",
+            imap_port=993,
+            imap_username="",
+            imap_password="app-password",
+        )
+        self.store.set_alias_profile("sold@icloud.com", netease["id"])
+
+        class FakeIMAP:
+            id_calls = []
+            selected_folders = []
+
+            def __init__(self, *args):
+                pass
+
+            def login(self, username, password):
+                pass
+
+            def _simple_command(self, command, payload):
+                self.id_calls.append((command, payload))
+                return "OK", [b"ID accepted"]
+
+            def select(self, folder, readonly):
+                self.selected_folders.append(folder)
+                return "NO", [b"Unsafe Login"]
+
+            def logout(self):
+                pass
+
+        with patch("mail_receiver.ProxyIMAP4SSL", FakeIMAP):
+            with self.assertRaisesRegex(RuntimeError, "Unsafe Login"):
+                self.receiver._sync_profile_blocking(netease["id"])
+
+        self.assertEqual(FakeIMAP.id_calls[0][0], "ID")
+        self.assertEqual(FakeIMAP.selected_folders, ['"INBOX"'])
+
 
 if __name__ == "__main__":
     unittest.main()
