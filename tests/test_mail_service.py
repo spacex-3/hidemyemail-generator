@@ -147,6 +147,67 @@ class MailServiceTests(unittest.TestCase):
         self.assertIn("Mailbox API", page)
         self.assertIn("/api/admin/profiles", page)
 
+    def test_customer_page_is_browser_facing_and_uses_its_own_key(self):
+        async def load_page():
+            app = create_mail_app(
+                self.store,
+                admin_password="admin-password",
+                public_base_url="https://mail.example.com",
+                start_receiver=False,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                page = await client.get(
+                    f"/openai/{self.public_id}?key={self.token}"
+                )
+                denied = await client.get(f"/openai/{self.public_id}?key=wrong")
+                return page.status, await page.text(), denied.status
+            finally:
+                await client.close()
+
+        status, page, denied = asyncio.run(load_page())
+
+        self.assertEqual((status, denied), (200, 404))
+        self.assertIn("OpenAI 验证码", page)
+        self.assertIn("sync=0", page)
+        self.assertNotIn("sold@icloud.com", page)
+
+    def test_bulk_export_requires_admin_and_marks_aliases_exported(self):
+        self.store.upsert_alias("second@icloud.com", "owner@example.com")
+
+        async def export():
+            app = create_mail_app(
+                self.store,
+                admin_password="admin-password",
+                public_base_url="https://mail.example.com",
+                start_receiver=False,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                denied = await client.post(
+                    "/api/admin/aliases/export",
+                    json={"emails": ["sold@icloud.com"]},
+                )
+                await client.post(
+                    "/api/admin/login", json={"password": "admin-password"}
+                )
+                exported = await client.post(
+                    "/api/admin/aliases/export",
+                    json={"emails": ["sold@icloud.com", "second@icloud.com"]},
+                )
+                return denied.status, exported.status, await exported.json()
+            finally:
+                await client.close()
+
+        denied, status, payload = asyncio.run(export())
+
+        self.assertEqual((denied, status), (401, 200))
+        self.assertIn("sold@icloud.com----https://mail.example.com/openai/", payload["export_text"])
+        self.assertEqual(len(payload["items"]), 2)
+        self.assertTrue(all(item["exported_at"] for item in self.store.list_aliases()))
+
 
 if __name__ == "__main__":
     unittest.main()

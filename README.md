@@ -176,14 +176,18 @@ docker compose up -d
 Open `http://<server>:8787` and sign in with `MAIL_ADMIN_PASSWORD`.
 
 1. Create an IMAP Profile for the mailbox that Apple forwards HME mail to.
-   Use a provider app password or authorization code, not its normal password.
+   Gmail, 126 Mail, 163 Mail, and iCloud Mail have built-in IMAP settings, so
+   those options require only the mailbox account and provider app password or
+   authorization code. Use Custom IMAP for other providers.
 2. Select `direct`, `SOCKS5 / SOCKS5h`, or `HTTP CONNECT` for that Profile.
    This affects only IMAP fetching; HME generation remains on the HME
    container's direct network route.
 3. Map each Apple source account to its default Profile, then apply an alias
    override only when that HME uses a different forwarding mailbox.
-4. Enable an alias and issue its API key. The key is shown once only; the
-   database stores only its SHA-256 hash.
+4. Filter the sales table by Apple source account and export state. It is
+   paginated at 100 aliases per page. Select unexported aliases and use batch
+   issue/export to download `HME----customer-page-url` records; each record is
+   marked exported so it cannot be accidentally exported twice.
 
 Existing `emails-{apple-id}.txt` files are imported automatically and remain
 unchanged, so addresses generated before this feature was installed can be
@@ -204,9 +208,13 @@ curl -H 'Authorization: Bearer CUSTOMER_API_KEY' \
 
 The response contains only `subject`, `received_at`, and the six-digit `code`.
 It never returns the HME address, Apple account, forwarding mailbox, IMAP
-credentials, or message body. The key may also be passed as `?key=` for a
-clickable integration URL, but the Authorization header is preferred because
-query strings are commonly retained in proxy access logs.
+credentials, or message body. A batch export instead gives customers a direct
+browser page URL. The page refreshes automatically and shows only the newest
+OpenAI code, title, and received time. The URL contains the per-alias secret,
+so treat it as the customer's password and do not publish it in a shared log.
+The programmatic API also accepts `?key=` for browser integrations, but the
+Authorization header is preferred because query strings are commonly retained
+in proxy access logs.
 
 Back up the full `data/` directory. In particular, `mailboxes.sqlite3` and
 `mailbox-secret.key` must be restored together: the latter encrypts IMAP

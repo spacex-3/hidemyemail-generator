@@ -170,6 +170,52 @@ class MailboxStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_retention_days(), 3)
         self.assertEqual(self.store.latest_openai_code("sold@icloud.com")["code"], "222222")
 
+    def test_common_provider_presets_only_need_account_and_app_password(self):
+        for preset, mailbox, host in (
+            ("gmail", "receiver@gmail.com", "imap.gmail.com"),
+            ("126", "receiver@126.com", "imap.126.com"),
+            ("163", "receiver@163.com", "imap.163.com"),
+        ):
+            with self.subTest(preset=preset):
+                profile = self.store.create_profile(
+                    preset=preset,
+                    label="",
+                    email=mailbox,
+                    imap_host="ignored.example.com",
+                    imap_port=1,
+                    imap_username="",
+                    imap_password="provider-app-password",
+                )
+
+                connection = self.store.profile_connection(profile["id"])
+                self.assertEqual(connection["imap_host"], host)
+                self.assertEqual(connection["imap_port"], 993)
+                self.assertEqual(connection["imap_username"], mailbox)
+                self.assertEqual(connection["folder"], "INBOX")
+
+    def test_paged_export_filter_and_bulk_token_issue_prevent_duplicate_export(self):
+        for number in range(101):
+            self.store.upsert_alias(
+                f"alias{number:03}@icloud.com", "owner@example.com"
+            )
+
+        aliases, total = self.store.list_aliases_page(
+            page=1, per_page=100, exported="unexported"
+        )
+        self.assertEqual((len(aliases), total), (100, 101))
+
+        issued = self.store.issue_export_tokens([item["email"] for item in aliases[:2]])
+        self.assertEqual(len(issued), 2)
+        self.assertTrue(all(item["token"] for item in issued))
+        self.assertTrue(all(item["public_id"] for item in issued))
+
+        remaining, total = self.store.list_aliases_page(
+            page=1, per_page=100, exported="unexported"
+        )
+        self.assertEqual((len(remaining), total), (99, 99))
+        with self.assertRaisesRegex(ValueError, "already exported"):
+            self.store.issue_export_tokens([issued[0]["email"]])
+
 
 if __name__ == "__main__":
     unittest.main()

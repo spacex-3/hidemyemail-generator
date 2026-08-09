@@ -19,6 +19,34 @@ from typing import Any
 from cryptography.fernet import Fernet
 
 
+IMAP_PRESETS = {
+    "gmail": {
+        "label": "Gmail",
+        "imap_host": "imap.gmail.com",
+        "imap_port": 993,
+        "folder": "INBOX",
+    },
+    "126": {
+        "label": "126 Mail",
+        "imap_host": "imap.126.com",
+        "imap_port": 993,
+        "folder": "INBOX",
+    },
+    "163": {
+        "label": "163 Mail",
+        "imap_host": "imap.163.com",
+        "imap_port": 993,
+        "folder": "INBOX",
+    },
+    "icloud": {
+        "label": "iCloud Mail",
+        "imap_host": "imap.mail.me.com",
+        "imap_port": 993,
+        "folder": "INBOX",
+    },
+}
+
+
 class MailboxStore:
     """SQLite store for forwarding profiles, aliases, tokens, and messages."""
 
@@ -87,6 +115,7 @@ class MailboxStore:
                 api_active INTEGER NOT NULL DEFAULT 0,
                 public_id TEXT UNIQUE,
                 token_hash TEXT NOT NULL DEFAULT '',
+                exported_at TEXT NOT NULL DEFAULT '',
                 buyer_note TEXT NOT NULL DEFAULT '',
                 expires_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -119,6 +148,16 @@ class MailboxStore:
                 updated_at TEXT NOT NULL
             );
             """
+        )
+        alias_columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(aliases)")
+        }
+        if "exported_at" not in alias_columns:
+            self._connection.execute(
+                "ALTER TABLE aliases ADD COLUMN exported_at TEXT NOT NULL DEFAULT ''"
+            )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_aliases_exported_at ON aliases(exported_at)"
         )
         self._connection.commit()
 
@@ -192,6 +231,61 @@ class MailboxStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_aliases_page(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 100,
+        source_account: str = "",
+        exported: str = "all",
+    ) -> tuple[list[dict[str, Any]], int]:
+        page = max(1, int(page))
+        per_page = max(1, min(100, int(per_page)))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source_account:
+            clauses.append("a.source_account = ?")
+            params.append(self._normalize_email(source_account))
+        if exported == "exported":
+            clauses.append("a.exported_at != ''")
+        elif exported == "unexported":
+            clauses.append("a.exported_at = ''")
+        elif exported != "all":
+            raise ValueError("Unsupported export filter")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            total = self._connection.execute(
+                f"SELECT COUNT(*) FROM aliases a {where}", params
+            ).fetchone()[0]
+            rows = self._connection.execute(
+                f"""
+                SELECT a.*, COALESCE(a.profile_id, ap.profile_id) AS effective_profile_id
+                FROM aliases a
+                LEFT JOIN account_profiles ap ON ap.source_account = a.source_account
+                {where}
+                ORDER BY a.email
+                LIMIT ? OFFSET ?
+                """,
+                [*params, per_page, (page - 1) * per_page],
+            ).fetchall()
+        return [dict(row) for row in rows], total
+
+    def alias_summary(self) -> dict[str, int]:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN api_active = 1 THEN 1 ELSE 0 END) AS active,
+                       SUM(CASE WHEN exported_at != '' THEN 1 ELSE 0 END) AS exported
+                FROM aliases
+                """
+            ).fetchone()
+        return {
+            "total": int(row["total"] or 0),
+            "active": int(row["active"] or 0),
+            "exported": int(row["exported"] or 0),
+        }
+
     def list_account_mappings(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
@@ -219,7 +313,18 @@ class MailboxStore:
         folder: str = "INBOX",
         network_mode: str = "direct",
         proxy_url: str = "",
+        preset: str = "custom",
     ) -> dict[str, Any]:
+        preset = str(preset or "custom").lower()
+        preset_config = IMAP_PRESETS.get(preset)
+        if preset != "custom" and preset_config is None:
+            raise ValueError("Unsupported IMAP preset")
+        if preset_config:
+            imap_host = preset_config["imap_host"]
+            imap_port = preset_config["imap_port"]
+            folder = preset_config["folder"]
+            imap_username = str(imap_username or email).strip()
+            label = str(label or "").strip() or f"{preset_config['label']} · {email}"
         if network_mode not in {"direct", "socks5", "http_connect"}:
             raise ValueError("Unsupported network mode")
         if not str(imap_password):
@@ -374,7 +479,7 @@ class MailboxStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def issue_api_token(self, email: str) -> str:
+    def issue_api_token(self, email: str, *, mark_exported: bool = False) -> str:
         email = self._normalize_email(email)
         token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(token.encode()).hexdigest()
@@ -383,15 +488,66 @@ class MailboxStore:
             cursor = self._connection.execute(
                 """
                 UPDATE aliases
-                SET public_id = ?, token_hash = ?, api_active = 1, updated_at = ?
+                SET public_id = ?, token_hash = ?, api_active = 1,
+                    exported_at = CASE WHEN ? THEN ? ELSE exported_at END,
+                    updated_at = ?
                 WHERE email = ?
                 """,
-                (public_id, token_hash, self._now(), email),
+                (
+                    public_id,
+                    token_hash,
+                    int(mark_exported),
+                    self._now(),
+                    self._now(),
+                    email,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("Unknown alias")
             self._connection.commit()
         return token
+
+    def issue_export_tokens(self, emails: list[str]) -> list[dict[str, str]]:
+        """Issue one-time customer secrets and mark them as exported atomically."""
+        normalized = []
+        seen = set()
+        for email in emails:
+            normalized_email = self._normalize_email(email)
+            if normalized_email not in seen:
+                normalized.append(normalized_email)
+                seen.add(normalized_email)
+        if not normalized:
+            raise ValueError("Select at least one alias")
+        if len(normalized) > 100:
+            raise ValueError("A batch can contain at most 100 aliases")
+
+        issued: list[dict[str, str]] = []
+        now = self._now()
+        with self._lock:
+            placeholders = ", ".join("?" for _ in normalized)
+            rows = self._connection.execute(
+                f"SELECT email, exported_at FROM aliases WHERE email IN ({placeholders})",
+                normalized,
+            ).fetchall()
+            if len(rows) != len(normalized):
+                raise ValueError("One or more selected aliases do not exist")
+            if any(row["exported_at"] for row in rows):
+                raise ValueError("Selected aliases include already exported records")
+            for email in normalized:
+                token = secrets.token_urlsafe(32)
+                public_id = f"mb_{secrets.token_urlsafe(9)}"
+                self._connection.execute(
+                    """
+                    UPDATE aliases
+                    SET public_id = ?, token_hash = ?, api_active = 1,
+                        exported_at = ?, updated_at = ?
+                    WHERE email = ?
+                    """,
+                    (public_id, hashlib.sha256(token.encode()).hexdigest(), now, now, email),
+                )
+                issued.append({"email": email, "public_id": public_id, "token": token, "exported_at": now})
+            self._connection.commit()
+        return issued
 
     def get_alias_by_token(self, token: str) -> dict[str, Any] | None:
         token_hash = hashlib.sha256(str(token or "").encode()).hexdigest()

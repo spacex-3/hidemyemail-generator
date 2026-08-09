@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import os
 import time
 from pathlib import Path
@@ -14,8 +15,12 @@ from urllib.parse import quote
 from aiohttp import web
 
 from mail_receiver import MailboxReceiver
-from mailbox_store import MailboxStore
-from mailbox_web import MAILBOX_DASHBOARD_HTML, MAILBOX_LOGIN_HTML
+from mailbox_store import IMAP_PRESETS, MailboxStore
+from mailbox_web import (
+    MAILBOX_DASHBOARD_HTML,
+    MAILBOX_LOGIN_HTML,
+    customer_mailbox_page,
+)
 
 
 SESSION_COOKIE = "hme_mail_admin"
@@ -37,6 +42,7 @@ def _public_alias(alias: dict) -> dict:
         "effective_profile_id": alias.get("effective_profile_id"),
         "api_active": bool(alias["api_active"]),
         "public_id": alias.get("public_id") or "",
+        "exported_at": alias.get("exported_at") or "",
         "buyer_note": alias.get("buyer_note") or "",
         "expires_at": alias.get("expires_at") or "",
         "created_at": alias["created_at"],
@@ -104,12 +110,31 @@ async def _admin_logout(_: web.Request) -> web.Response:
 async def _admin_status(request: web.Request) -> web.Response:
     store: MailboxStore = request.app["store"]
     store.import_alias_history()
-    aliases = [_public_alias(alias) for alias in store.list_aliases()]
+    try:
+        page = max(1, int(request.query.get("page", "1")))
+        aliases, total = store.list_aliases_page(
+            page=page,
+            per_page=100,
+            source_account=request.query.get("source_account", ""),
+            exported=request.query.get("exported", "all"),
+        )
+    except ValueError as exc:
+        return _json({"success": False, "error": str(exc)}, 400)
     return _json({
         "success": True,
-        "aliases": aliases,
+        "aliases": [_public_alias(alias) for alias in aliases],
         "accounts": store.list_account_mappings(),
         "profiles": store.list_profiles(),
+        "imap_presets": IMAP_PRESETS,
+        "summary": store.alias_summary(),
+        "pagination": {
+            "page": page,
+            "per_page": 100,
+            "total": total,
+            "pages": max(1, (total + 99) // 100),
+            "source_account": request.query.get("source_account", ""),
+            "exported": request.query.get("exported", "all"),
+        },
         "retention_days": store.get_retention_days(),
         "public_base_url": request.app["public_base_url"],
     })
@@ -128,6 +153,7 @@ async def _admin_create_profile(request: web.Request) -> web.Response:
             folder=str(payload.get("folder") or "INBOX"),
             network_mode=str(payload.get("network_mode") or "direct"),
             proxy_url=str(payload.get("proxy_url") or ""),
+            preset=str(payload.get("preset") or "custom"),
         )
         return _json({"success": True, "profile": profile}, 201)
     except (TypeError, ValueError) as exc:
@@ -159,18 +185,48 @@ async def _admin_set_alias_profile(request: web.Request) -> web.Response:
 async def _admin_issue_token(request: web.Request) -> web.Response:
     try:
         email = request.match_info["email"]
-        token = request.app["store"].issue_api_token(email)
+        token = request.app["store"].issue_api_token(email, mark_exported=True)
         alias = request.app["store"].get_alias_by_token(token)
         base_url = request.app["public_base_url"].rstrip("/")
         endpoint = f"{base_url}/api/v1/openai/mailboxes/{quote(alias['public_id'])}/latest"
+        page_url = f"{base_url}/openai/{quote(alias['public_id'])}?key={quote(token)}"
         return _json({
             "success": True,
             "token": token,
             "api_url": endpoint,
+            "page_url": page_url,
             "authorization": f"Bearer {token}",
+            "public_id": alias["public_id"],
+            "exported_at": alias["exported_at"],
         })
     except ValueError as exc:
         return _json({"success": False, "error": str(exc)}, 404)
+
+
+async def _admin_bulk_issue_export(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+        emails = payload.get("emails")
+        if not isinstance(emails, list):
+            raise ValueError("emails must be a list")
+        issued = request.app["store"].issue_export_tokens(emails)
+        base_url = request.app["public_base_url"].rstrip("/")
+        items = []
+        lines = []
+        for item in issued:
+            page_url = (
+                f"{base_url}/openai/{quote(item['public_id'])}?key={quote(item['token'])}"
+            )
+            lines.append(f"{item['email']}----{page_url}")
+            items.append({
+                "email": item["email"],
+                "public_id": item["public_id"],
+                "exported_at": item["exported_at"],
+                "page_url": page_url,
+            })
+        return _json({"success": True, "items": items, "export_text": "\n".join(lines)})
+    except (TypeError, ValueError) as exc:
+        return _json({"success": False, "error": str(exc)}, 400)
 
 
 async def _admin_update_sales(request: web.Request) -> web.Response:
@@ -218,7 +274,7 @@ async def _public_openai_code(request: web.Request) -> web.Response:
 
     after = request.query.get("after", "")
     message = store.latest_openai_code(alias["email"], after=after)
-    if message is None:
+    if message is None and request.query.get("sync", "1") != "0":
         try:
             profile = store.effective_profile_for_alias(alias["email"])
             if profile is not None:
@@ -239,6 +295,24 @@ async def _public_openai_code(request: web.Request) -> web.Response:
         "received_at": message["received_at"],
         "code": message["code"],
     })
+
+
+async def _public_mailbox_page(request: web.Request) -> web.Response:
+    public_id = request.match_info["public_id"]
+    token = request.query.get("key", "")
+    alias = request.app["store"].get_alias_by_token(token)
+    if alias is None or alias.get("public_id") != public_id:
+        return web.Response(status=404, text="Not found")
+    api_url = (
+        f"/api/v1/openai/mailboxes/{quote(public_id)}/latest?key={quote(token)}&sync=0"
+    )
+    response = web.Response(
+        text=customer_mailbox_page(json.dumps(api_url)), content_type="text/html"
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
 
 
 def create_mail_app(
@@ -270,6 +344,7 @@ def create_mail_app(
         if (
             request.path in public_paths
             or request.path.startswith("/api/v1/openai/")
+            or request.path.startswith("/openai/")
             or _admin_required(request)
         ):
             return await handler(request)
@@ -310,10 +385,12 @@ def create_mail_app(
     app.router.add_post("/api/admin/accounts/{account}/profile", _admin_set_account_profile)
     app.router.add_post("/api/admin/aliases/{email}/profile", _admin_set_alias_profile)
     app.router.add_post("/api/admin/aliases/{email}/token", _admin_issue_token)
+    app.router.add_post("/api/admin/aliases/export", _admin_bulk_issue_export)
     app.router.add_post("/api/admin/aliases/{email}/sales", _admin_update_sales)
     app.router.add_post("/api/admin/profiles/{profile_id}/sync", _admin_sync_profile)
     app.router.add_post("/api/admin/settings/retention", _admin_update_retention)
     app.router.add_get("/api/v1/openai/mailboxes/{public_id}/latest", _public_openai_code)
+    app.router.add_get("/openai/{public_id}", _public_mailbox_page)
     return app
 
 
