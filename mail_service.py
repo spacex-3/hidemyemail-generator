@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime as dt
 import hashlib
 import hmac
 import json
@@ -25,6 +26,7 @@ from mailbox_web import (
 
 SESSION_COOKIE = "hme_mail_admin"
 SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
+OPENAI_CODE_MAX_AGE_MINUTES = 10
 
 
 def _json(payload: dict, status: int = 200) -> web.Response:
@@ -285,20 +287,29 @@ async def _public_openai_code(request: web.Request) -> web.Response:
         return _json({"success": False, "code": "not_found"}, 404)
 
     after = request.query.get("after", "")
-    message = store.latest_openai_code(alias["email"], after=after)
+    freshness_cutoff = (
+        dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(minutes=OPENAI_CODE_MAX_AGE_MINUTES)
+    ).isoformat()
+    minimum_received_at = max(str(after), freshness_cutoff) if after else freshness_cutoff
+    message = store.latest_openai_code(alias["email"], after=minimum_received_at)
     if message is None and request.query.get("sync", "1") != "0":
         try:
             profile = store.effective_profile_for_alias(alias["email"])
             if profile is not None:
                 await request.app["receiver"].sync_profile(profile["id"], recent=True)
-                message = store.latest_openai_code(alias["email"], after=after)
+                message = store.latest_openai_code(
+                    alias["email"], after=minimum_received_at
+                )
         except Exception:
-            message = store.latest_openai_code(alias["email"], after=after)
+            message = store.latest_openai_code(alias["email"], after=minimum_received_at)
     if message is None:
         return _json({
             "success": False,
             "code": "no_code",
-            "message": "No new OpenAI verification code",
+            "message": (
+                f"最近 {OPENAI_CODE_MAX_AGE_MINUTES} 分钟没有新的 OpenAI 验证码"
+            ),
             "retryable": True,
         })
     return _json({

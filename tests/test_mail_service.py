@@ -1,4 +1,5 @@
 import asyncio
+import datetime as dt
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +24,7 @@ class MailServiceTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def test_customer_endpoint_returns_only_latest_openai_code_fields(self):
+        received_at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)).isoformat()
         self.store.record_openai_message(
             alias_email="sold@icloud.com",
             profile_id="profile-1",
@@ -30,7 +32,7 @@ class MailServiceTests(unittest.TestCase):
             sender="noreply@tm.openai.com",
             subject="Your OpenAI verification code",
             code="123456",
-            received_at="2026-08-09T10:00:00+00:00",
+            received_at=received_at,
         )
 
         async def request_code():
@@ -57,7 +59,7 @@ class MailServiceTests(unittest.TestCase):
         self.assertEqual(payload, {
             "success": True,
             "subject": "Your OpenAI verification code",
-            "received_at": "2026-08-09T10:00:00+00:00",
+            "received_at": received_at,
             "code": "123456",
         })
 
@@ -85,6 +87,44 @@ class MailServiceTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(payload["success"], False)
         self.assertNotIn("sold@icloud.com", str(payload))
+
+    def test_customer_endpoint_does_not_return_a_code_older_than_ten_minutes(self):
+        received_at = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=11)
+        ).isoformat()
+        self.store.record_openai_message(
+            alias_email="sold@icloud.com",
+            profile_id="profile-1",
+            remote_id="expired-code",
+            sender="noreply@tm.openai.com",
+            subject="Your OpenAI verification code",
+            code="123456",
+            received_at=received_at,
+        )
+
+        async def request_code():
+            app = create_mail_app(
+                self.store,
+                admin_password="admin-password",
+                public_base_url="https://mail.example.com",
+                start_receiver=False,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    f"/api/v1/openai/mailboxes/{self.public_id}/latest?sync=0",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                )
+                return response.status, await response.json()
+            finally:
+                await client.close()
+
+        status, payload = asyncio.run(request_code())
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["code"], "no_code")
+        self.assertEqual(payload["message"], "最近 10 分钟没有新的 OpenAI 验证码")
 
     def test_admin_login_is_required_for_alias_management(self):
         async def admin_status():
