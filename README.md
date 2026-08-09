@@ -193,6 +193,13 @@ Existing `emails-{apple-id}.txt` files are imported automatically and remain
 unchanged, so addresses generated before this feature was installed can be
 configured and sold in the same way as new ones.
 
+Each Profile has a **Recent mail** action in the admin page. It re-scans the
+last 20 messages and shows the sender, subject, recipient-routing headers,
+OpenAI/code detection result, and matched HME aliases. This is the first place
+to check when mail is visible in a provider webmail UI but no code appears on
+the customer page. The diagnostic view is admin-only and never shown to a
+customer.
+
 The background worker imports new aliases and polls every configured interval.
 It stores only strictly routed OpenAI/ChatGPT verification messages, then
 purges cached subject, timestamp, and code after the configured retention

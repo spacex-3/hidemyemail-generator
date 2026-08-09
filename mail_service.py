@@ -257,8 +257,20 @@ async def _admin_update_retention(request: web.Request) -> web.Response:
 
 async def _admin_sync_profile(request: web.Request) -> web.Response:
     try:
-        count = await request.app["receiver"].sync_profile(request.match_info["profile_id"])
+        count = await request.app["receiver"].sync_profile(
+            request.match_info["profile_id"], recent=True
+        )
         return _json({"success": True, "imported": count})
+    except Exception as exc:
+        return _json({"success": False, "error": str(exc)}, 502)
+
+
+async def _admin_inspect_profile(request: web.Request) -> web.Response:
+    try:
+        result = await request.app["receiver"].inspect_profile(
+            request.match_info["profile_id"]
+        )
+        return _json({"success": True, **result})
     except Exception as exc:
         return _json({"success": False, "error": str(exc)}, 502)
 
@@ -278,7 +290,7 @@ async def _public_openai_code(request: web.Request) -> web.Response:
         try:
             profile = store.effective_profile_for_alias(alias["email"])
             if profile is not None:
-                await request.app["receiver"].sync_profile(profile["id"])
+                await request.app["receiver"].sync_profile(profile["id"], recent=True)
                 message = store.latest_openai_code(alias["email"], after=after)
         except Exception:
             message = store.latest_openai_code(alias["email"], after=after)
@@ -304,7 +316,7 @@ async def _public_mailbox_page(request: web.Request) -> web.Response:
     if alias is None or alias.get("public_id") != public_id:
         return web.Response(status=404, text="Not found")
     api_url = (
-        f"/api/v1/openai/mailboxes/{quote(public_id)}/latest?key={quote(token)}&sync=0"
+        f"/api/v1/openai/mailboxes/{quote(public_id)}/latest?key={quote(token)}&sync=1"
     )
     response = web.Response(
         text=customer_mailbox_page(json.dumps(api_url)), content_type="text/html"
@@ -388,6 +400,7 @@ def create_mail_app(
     app.router.add_post("/api/admin/aliases/export", _admin_bulk_issue_export)
     app.router.add_post("/api/admin/aliases/{email}/sales", _admin_update_sales)
     app.router.add_post("/api/admin/profiles/{profile_id}/sync", _admin_sync_profile)
+    app.router.add_post("/api/admin/profiles/{profile_id}/inspect", _admin_inspect_profile)
     app.router.add_post("/api/admin/settings/retention", _admin_update_retention)
     app.router.add_get("/api/v1/openai/mailboxes/{public_id}/latest", _public_openai_code)
     app.router.add_get("/openai/{public_id}", _public_mailbox_page)

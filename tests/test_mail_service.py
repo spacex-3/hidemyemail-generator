@@ -170,7 +170,8 @@ class MailServiceTests(unittest.TestCase):
 
         self.assertEqual((status, denied), (200, 404))
         self.assertIn("OpenAI 验证码", page)
-        self.assertIn("sync=0", page)
+        self.assertIn("sync=1", page)
+        self.assertIn("秒后刷新", page)
         self.assertNotIn("sold@icloud.com", page)
 
     def test_bulk_export_requires_admin_and_marks_aliases_exported(self):

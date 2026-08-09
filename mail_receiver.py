@@ -157,12 +157,44 @@ class MailboxReceiver:
             except asyncio.TimeoutError:
                 pass
 
-    async def sync_profile(self, profile_id: str) -> int:
+    async def sync_profile(self, profile_id: str, *, recent: bool = False) -> int:
         lock = self._profile_locks.setdefault(profile_id, asyncio.Lock())
         async with lock:
-            return await asyncio.to_thread(self._sync_profile_blocking, profile_id)
+            return await asyncio.to_thread(
+                self._sync_profile_blocking, profile_id, recent=recent
+            )
 
-    def _sync_profile_blocking(self, profile_id: str) -> int:
+    @staticmethod
+    def _raw_message(payload) -> bytes:
+        return next(
+            (item[1] for item in payload if isinstance(item, tuple) and len(item) > 1),
+            b"",
+        )
+
+    def _connect_profile(self, profile: dict):
+        client = ProxyIMAP4SSL(
+            profile["imap_host"],
+            int(profile["imap_port"]),
+            profile["proxy_url"] if profile["network_mode"] != "direct" else "",
+        )
+        client.login(profile["imap_username"], profile["imap_password"])
+        status, _ = client.select(profile["folder"], readonly=True)
+        if status != "OK":
+            try:
+                client.logout()
+            except Exception:
+                pass
+            raise RuntimeError(f"Cannot select IMAP folder {profile['folder']}")
+        return client
+
+    @staticmethod
+    def _all_uids(client) -> list[int]:
+        status, data = client.uid("search", None, "ALL")
+        if status != "OK":
+            raise RuntimeError("IMAP UID search failed")
+        return [int(item) for item in (data[0].split() if data and data[0] else [])]
+
+    def _sync_profile_blocking(self, profile_id: str, *, recent: bool = False) -> int:
         profile = self.store.profile_connection(profile_id)
         if profile is None:
             raise ValueError("Unknown profile")
@@ -175,30 +207,16 @@ class MailboxReceiver:
         newest_uid = int(profile["last_uid"] or 0)
         imported = 0
         try:
-            client = ProxyIMAP4SSL(
-                profile["imap_host"],
-                int(profile["imap_port"]),
-                profile["proxy_url"] if profile["network_mode"] != "direct" else "",
-            )
-            client.login(profile["imap_username"], profile["imap_password"])
-            status, _ = client.select(profile["folder"], readonly=True)
-            if status != "OK":
-                raise RuntimeError(f"Cannot select IMAP folder {profile['folder']}")
-            status, data = client.uid("search", None, "ALL")
-            if status != "OK":
-                raise RuntimeError("IMAP UID search failed")
-            uids = [int(item) for item in (data[0].split() if data and data[0] else [])]
+            client = self._connect_profile(profile)
+            uids = self._all_uids(client)
             candidates = [uid for uid in uids if uid > newest_uid]
-            if newest_uid == 0:
+            if recent or newest_uid == 0:
                 candidates = uids[-20:]
             for uid in candidates:
                 status, payload = client.uid("fetch", str(uid), "(RFC822)")
                 if status != "OK":
                     continue
-                raw = next(
-                    (item[1] for item in payload if isinstance(item, tuple) and len(item) > 1),
-                    b"",
-                )
+                raw = self._raw_message(payload)
                 if raw and self.ingest_raw_message(profile_id, str(uid), raw):
                     imported += 1
                 newest_uid = max(newest_uid, uid)
@@ -214,22 +232,98 @@ class MailboxReceiver:
                 except Exception:
                     pass
 
-    def ingest_raw_message(self, profile_id: str, remote_id: str, raw: bytes) -> bool:
+    async def inspect_profile(self, profile_id: str) -> dict:
+        """Re-scan recent mail and return admin-only routing diagnostics."""
+        lock = self._profile_locks.setdefault(profile_id, asyncio.Lock())
+        async with lock:
+            return await asyncio.to_thread(self._inspect_profile_blocking, profile_id)
+
+    def _inspect_profile_blocking(self, profile_id: str) -> dict:
+        profile = self.store.profile_connection(profile_id)
+        if profile is None:
+            raise ValueError("Unknown profile")
+
+        client = None
+        imported = 0
+        diagnostics = []
+        try:
+            client = self._connect_profile(profile)
+            uids = self._all_uids(client)[-20:]
+            for uid in reversed(uids):
+                status, payload = client.uid("fetch", str(uid), "(RFC822)")
+                if status != "OK":
+                    continue
+                raw = self._raw_message(payload)
+                if not raw:
+                    continue
+                diagnostic = self.message_diagnostic(profile_id, str(uid), raw)
+                if diagnostic["eligible"]:
+                    if self.ingest_raw_message(profile_id, str(uid), raw):
+                        imported += 1
+                        diagnostic["status"] = "imported"
+                    else:
+                        diagnostic["status"] = "already_cached"
+                diagnostics.append(diagnostic)
+            if uids:
+                self.store.update_profile_sync(profile_id, last_uid=max(uids))
+            else:
+                self.store.update_profile_sync(profile_id)
+            return {"imported": imported, "messages": diagnostics}
+        except Exception as exc:
+            self.store.update_profile_sync(profile_id, error=str(exc))
+            raise
+        finally:
+            if client is not None:
+                try:
+                    client.logout()
+                except Exception:
+                    pass
+
+    def message_diagnostic(self, profile_id: str, remote_id: str, raw: bytes) -> dict:
+        """Describe why a message will or will not enter the OpenAI cache."""
         message = email.message_from_bytes(raw)
         sender = parseaddr(message.get("From", ""))[1].lower()
-        if not is_openai_message(sender):
-            return False
         subject = _decode_header(message.get("Subject", ""))
-        code = extract_openai_code(f"{subject}\n{_message_text(message)}")
-        if not code:
-            return False
+        routing = {
+            header: _decode_header(message.get(header, ""))
+            for header in RECIPIENT_HEADERS
+            if message.get(header, "")
+        }
+        recipient_text = " ".join(routing.values()).lower()
+        matches = [
+            item["email"]
+            for item in self.store.aliases_for_profile(profile_id)
+            if item["email"] in recipient_text
+        ]
+        openai = is_openai_message(sender)
+        code = extract_openai_code(f"{subject}\n{_message_text(message)}") if openai else ""
+        if not openai:
+            status = "ignored_sender"
+        elif not code:
+            status = "no_verification_code"
+        elif len(matches) == 0:
+            status = "no_matching_hme"
+        elif len(matches) > 1:
+            status = "ambiguous_hme"
+        else:
+            status = "eligible"
+        return {
+            "uid": remote_id,
+            "sender": sender,
+            "subject": subject,
+            "received_at": _decode_header(message.get("Date", "")),
+            "routing": routing,
+            "is_openai": openai,
+            "code": code,
+            "matched_aliases": matches,
+            "eligible": status == "eligible",
+            "status": status,
+        }
 
-        recipient_text = " ".join(
-            _decode_header(message.get(header, "")) for header in RECIPIENT_HEADERS
-        ).lower()
-        aliases = self.store.aliases_for_profile(profile_id)
-        matches = [item for item in aliases if item["email"] in recipient_text]
-        if len(matches) != 1:
+    def ingest_raw_message(self, profile_id: str, remote_id: str, raw: bytes) -> bool:
+        message = email.message_from_bytes(raw)
+        diagnostic = self.message_diagnostic(profile_id, remote_id, raw)
+        if not diagnostic["eligible"]:
             return False
 
         try:
@@ -239,11 +333,11 @@ class MailboxReceiver:
         except Exception:
             received_at = dt.datetime.now(dt.timezone.utc)
         return self.store.record_openai_message(
-            alias_email=matches[0]["email"],
+            alias_email=diagnostic["matched_aliases"][0],
             profile_id=profile_id,
             remote_id=remote_id,
-            sender=sender,
-            subject=subject,
-            code=code,
+            sender=diagnostic["sender"],
+            subject=diagnostic["subject"],
+            code=diagnostic["code"],
             received_at=received_at.astimezone(dt.timezone.utc).isoformat(),
         )

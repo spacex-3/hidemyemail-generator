@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -113,6 +114,53 @@ class OpenAIReceiverTests(unittest.TestCase):
 
         self.assertEqual(imported, 1)
         self.assertEqual(FakeIMAP.proxy_urls, [""])
+        self.assertEqual(self.store.latest_openai_code("sold@icloud.com")["code"], "246810")
+
+    def test_recent_inspection_rescans_and_reports_routing_diagnostics(self):
+        openai_raw = b"\r\n".join([
+            b"From: OpenAI <noreply@tm.openai.com>",
+            b"X-Original-To: sold@icloud.com",
+            b"Subject: Your OpenAI verification code",
+            b"Date: Sat, 09 Aug 2026 10:00:00 +0000",
+            b"",
+            b"Your OpenAI verification code is 246810.",
+        ])
+        unrelated_raw = b"\r\n".join([
+            b"From: billing@example.com",
+            b"To: receiver@example.com",
+            b"Subject: Invoice",
+            b"",
+            b"Invoice 123456",
+        ])
+
+        class FakeIMAP:
+            def __init__(self, *args):
+                pass
+
+            def login(self, username, password):
+                pass
+
+            def select(self, folder, readonly):
+                return "OK", [b""]
+
+            def uid(self, command, *args):
+                if command == "search":
+                    return "OK", [b"100 101"]
+                if command == "fetch":
+                    raw = openai_raw if args[0] == "100" else unrelated_raw
+                    return "OK", [(b"RFC822", raw)]
+                raise AssertionError(command)
+
+            def logout(self):
+                pass
+
+        with patch("mail_receiver.ProxyIMAP4SSL", FakeIMAP):
+            result = asyncio.run(self.receiver.inspect_profile(self.profile["id"]))
+
+        self.assertEqual(result["imported"], 1)
+        self.assertEqual(result["messages"][0]["status"], "ignored_sender")
+        self.assertEqual(result["messages"][1]["status"], "imported")
+        self.assertEqual(result["messages"][1]["matched_aliases"], ["sold@icloud.com"])
         self.assertEqual(self.store.latest_openai_code("sold@icloud.com")["code"], "246810")
 
 
