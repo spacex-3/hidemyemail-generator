@@ -37,7 +37,10 @@ def _decode_header(value: str) -> str:
     parts = []
     for fragment, encoding in decode_header(value or ""):
         if isinstance(fragment, bytes):
-            parts.append(fragment.decode(encoding or "utf-8", errors="replace"))
+            try:
+                parts.append(fragment.decode(encoding or "utf-8", errors="replace"))
+            except LookupError:
+                parts.append(fragment.decode("utf-8", errors="replace"))
         else:
             parts.append(fragment)
     return "".join(parts)
@@ -71,8 +74,16 @@ def _message_text(message: email.message.Message) -> str:
 
 
 def is_openai_message(sender: str) -> bool:
+    """Recognize direct OpenAI senders and iCloud's forwarded sender rewrite."""
     address = parseaddr(sender or "")[1].lower()
-    return any(address == domain or address.endswith(f".{domain}") for domain in OPENAI_SENDER_DOMAINS)
+    if any(address == domain or address.endswith(f".{domain}") for domain in OPENAI_SENDER_DOMAINS):
+        return True
+    local, _, domain = address.partition("@")
+    # Hide My Email can rewrite `otp@tm.openai.com` into a traceable iCloud
+    # sender such as `otp_at_tm1_openai_com_...@icloud.com`.
+    return domain == "icloud.com" and bool(
+        re.search(r"(?:^|[_-])(?:tm\d+_)?openai(?:[_-]com)?(?:[_-]|$)", local)
+    )
 
 
 def extract_openai_code(text: str) -> str:
@@ -80,6 +91,8 @@ def extract_openai_code(text: str) -> str:
         r"(?:openai|chatgpt)[^\d]{0,80}(?:verification|login)?\s*code[^\d]{0,24}(\d{6})",
         r"(?:verification|login)\s+code[^\d]{0,24}(\d{6})",
         r"code\s+(?:is|:|：)\s*(\d{6})",
+        r"(?:验证码|验证代码|临时验证码|一次性密码|登录代码)[^\d]{0,24}(\d{6})",
+        r"(\d{6})[^\d]{0,24}(?:验证码|验证代码|临时验证码|一次性密码|登录代码)",
     )
     for pattern in patterns:
         match = re.search(pattern, text or "", flags=re.IGNORECASE)
@@ -338,7 +351,7 @@ class MailboxReceiver:
             for item in self.store.aliases_for_profile(profile_id)
             if item["email"] in recipient_text
         ]
-        openai = is_openai_message(sender)
+        openai = is_openai_message(message.get("From", ""))
         code = extract_openai_code(f"{subject}\n{_message_text(message)}") if openai else ""
         if not openai:
             status = "ignored_sender"

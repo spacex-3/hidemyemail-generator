@@ -31,12 +31,36 @@ class OpenAIReceiverTests(unittest.TestCase):
     def test_accepts_openai_sender_and_extracts_contextual_code(self):
         self.assertTrue(is_openai_message("noreply@tm.openai.com"))
         self.assertTrue(is_openai_message("security@mail.openai.com"))
+        self.assertTrue(
+            is_openai_message("otp_at_tm1_openai_com_token@icloud.com")
+        )
         self.assertFalse(is_openai_message("noreply@example.com"))
         self.assertEqual(
             extract_openai_code("Your OpenAI verification code is 123456."),
             "123456",
         )
         self.assertEqual(extract_openai_code("Invoice 123456"), "")
+        self.assertEqual(
+            extract_openai_code("123456 是你的 ChatGPT 临时验证码"), "123456"
+        )
+
+    def test_ingests_icloud_forwarded_openai_mail_with_chinese_code_text(self):
+        raw = b"\r\n".join([
+            b"From: otp_at_tm1_openai_com_token@icloud.com",
+            b"To: Hide My Email <sold@icloud.com>",
+            "Subject: 你的 ChatGPT 临时验证码".encode(),
+            b"Date: Sat, 09 Aug 2026 10:00:00 +0000",
+            b"Content-Type: text/plain; charset=utf-8",
+            b"",
+            "246810 是你的 ChatGPT 临时验证码".encode(),
+        ])
+
+        self.assertTrue(
+            self.receiver.ingest_raw_message(
+                profile_id=self.profile["id"], remote_id="forwarded-1", raw=raw
+            )
+        )
+        self.assertEqual(self.store.latest_openai_code("sold@icloud.com")["code"], "246810")
 
     def test_ingests_only_strictly_routed_openai_messages(self):
         raw = b"\r\n".join([
