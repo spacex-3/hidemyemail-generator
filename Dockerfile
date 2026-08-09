@@ -10,6 +10,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8080
+EXPOSE 8080 8787
 
 CMD ["python", "cli.py", "serve", "--port", "8080"]

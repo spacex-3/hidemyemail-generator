@@ -9,3 +9,19 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+
+  mail:
+    image: ghcr.io/spacex-3/hidemyemail-generator:latest
+    container_name: hme-mail
+    command: ["python", "mail_service.py"]
+    ports:
+      - "8787:8787"
+    environment:
+      - DATA_DIR=/app/data
+      - MAIL_ADMIN_PASSWORD=${MAIL_ADMIN_PASSWORD:-}
+      - MAIL_PUBLIC_BASE_URL=${MAIL_PUBLIC_BASE_URL:-http://localhost:8787}
+      - MAIL_POLL_SECONDS=${MAIL_POLL_SECONDS:-60}
+      - MAIL_COOKIE_SECURE=${MAIL_COOKIE_SECURE:-false}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

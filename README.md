@@ -146,6 +146,73 @@ The dashboard will continue loading those historical records after startup, and 
 
 Existing generated email history can be reused directly, but saved login sessions may not remain reusable across machines or containers. After migration, simply log in again from the dashboard. New session files will be stored under `data/sessions/`.
 
+## Mailbox Verification API
+
+The optional `mail` service is a separate sidecar for selling existing HME
+addresses with an OpenAI verification-code API. It does **not** modify the HME
+generator, Apple session, account scheduler, cooldown, or generated-email
+history. It only reads `data/emails-*.txt` to discover aliases.
+
+Before starting it, create a `.env` file next to `docker-compose.yml`:
+
+```bash
+MAIL_ADMIN_PASSWORD=replace-with-a-long-random-password
+MAIL_PUBLIC_BASE_URL=https://mail.example.com
+MAIL_POLL_SECONDS=60
+MAIL_COOKIE_SECURE=true
+```
+
+`MAIL_PUBLIC_BASE_URL` must be the public HTTPS URL that customers will call.
+When running only on a private LAN, use the reachable `http://host:8787` URL
+and leave `MAIL_COOKIE_SECURE=false`.
+
+Start or update both services:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Open `http://<server>:8787` and sign in with `MAIL_ADMIN_PASSWORD`.
+
+1. Create an IMAP Profile for the mailbox that Apple forwards HME mail to.
+   Use a provider app password or authorization code, not its normal password.
+2. Select `direct`, `SOCKS5 / SOCKS5h`, or `HTTP CONNECT` for that Profile.
+   This affects only IMAP fetching; HME generation remains on the HME
+   container's direct network route.
+3. Map each Apple source account to its default Profile, then apply an alias
+   override only when that HME uses a different forwarding mailbox.
+4. Enable an alias and issue its API key. The key is shown once only; the
+   database stores only its SHA-256 hash.
+
+Existing `emails-{apple-id}.txt` files are imported automatically and remain
+unchanged, so addresses generated before this feature was installed can be
+configured and sold in the same way as new ones.
+
+The background worker imports new aliases and polls every configured interval.
+It stores only strictly routed OpenAI/ChatGPT verification messages, then
+purges cached subject, timestamp, and code after the configured retention
+period (default: 7 days). A customer request reads this cache and makes one
+immediate IMAP refresh when no matching code is cached.
+
+Customer request format:
+
+```bash
+curl -H 'Authorization: Bearer CUSTOMER_API_KEY' \
+  'https://mail.example.com/api/v1/openai/mailboxes/MAILBOX_ID/latest'
+```
+
+The response contains only `subject`, `received_at`, and the six-digit `code`.
+It never returns the HME address, Apple account, forwarding mailbox, IMAP
+credentials, or message body. The key may also be passed as `?key=` for a
+clickable integration URL, but the Authorization header is preferred because
+query strings are commonly retained in proxy access logs.
+
+Back up the full `data/` directory. In particular, `mailboxes.sqlite3` and
+`mailbox-secret.key` must be restored together: the latter encrypts IMAP
+passwords and proxy URLs. Do not expose port 8787 directly to the internet
+without HTTPS and a reverse proxy; restrict the admin page to yourself.
+
 ## 🏗️ Project Structure
 
 ```
